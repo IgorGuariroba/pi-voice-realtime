@@ -7,7 +7,8 @@
  * descartamos o que ainda estava no buffer de captura.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import { SAMPLE_RATE } from "./config.ts";
 
 export const BYTES_PER_SAMPLE = 2;
@@ -142,7 +143,7 @@ export function rmsLevel(pcm: Buffer): number {
  * e a API Realtime espera base64 de frames contínuos.
  */
 export class FrameChunker {
-	private remainder = Buffer.alloc(0);
+	private remainder: Buffer = Buffer.alloc(0);
 	private readonly frameBytes: number;
 
 	constructor(frameBytes: number = FRAME_BYTES) {
@@ -178,7 +179,7 @@ export interface RecorderHandlers {
 }
 
 export class Recorder {
-	private child: ChildProcessWithoutNullStreams | undefined;
+	private child: ChildProcessByStdio<null, Readable, Readable> | undefined;
 	private chunker = new FrameChunker();
 	private muted = false;
 	private stopping = false;
@@ -240,7 +241,7 @@ export class Recorder {
 
 /** Player com fila simples; `stop()` interrompe a fala em andamento (barge-in). */
 export class Player {
-	private child: ChildProcessWithoutNullStreams | undefined;
+	private child: ChildProcessByStdio<Writable, null, Readable> | undefined;
 	private started = false;
 	private readonly backend: Backend;
 	private readonly onError?: (error: Error) => void;
@@ -250,7 +251,7 @@ export class Player {
 		this.onError = onError;
 	}
 
-	private ensure(): ChildProcessWithoutNullStreams | undefined {
+	private ensure(): ChildProcessByStdio<Writable, null, Readable> | undefined {
 		if (this.started && this.child) return this.child;
 		try {
 			const child = spawn(this.backend.command, this.backend.args, {

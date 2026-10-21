@@ -19,7 +19,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Player, Recorder, rmsLevel } from "./audio.ts";
-import { openEchoAudio, type EchoAudio } from "./echo.ts";
+import { openEchoAudio, EchoCleanup, type EchoAudio } from "./echo.ts";
 import {
 	VOICES,
 	loadSettings,
@@ -42,6 +42,7 @@ export default function (pi: ExtensionAPI) {
 	let recorder: Recorder | undefined;
 	let player: Player | undefined;
 	let echoAudio: EchoAudio | undefined;
+	const echoCleanup = new EchoCleanup();
 	let muted = false;
 	let speaking = false;
 	let pendingDelegations = 0;
@@ -82,7 +83,8 @@ export default function (pi: ExtensionAPI) {
 		player = undefined;
 		const oldEcho = echoAudio;
 		echoAudio = undefined;
-		void oldEcho?.close().catch(() => ctx.ui.notify("falha ao liberar módulo AEC", "warning"));
+		if (oldEcho) echoCleanup.add(oldEcho);
+		void echoCleanup.flush().catch(() => ctx.ui.notify("falha ao liberar módulo AEC; limpeza será tentada novamente", "warning"));
 		speaking = false;
 		pendingDelegations = 0;
 		view = { phase: "listening", level: 0, speaking: false };
@@ -159,7 +161,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			const routes = await openEchoAudio();
 			if (session !== current) {
-				await routes.close();
+				echoCleanup.add(routes);
+				await echoCleanup.flush().catch(() => ctx.ui.notify("falha ao liberar AEC de sessão cancelada", "warning"));
 				return;
 			}
 			echoAudio = routes;
@@ -302,6 +305,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				case "stop":
 					if (!active()) {
+						await echoCleanup.flush().catch(() => ctx.ui.notify("falha ao liberar módulo AEC", "warning"));
 						ctx.ui.notify("nenhuma sessão de voz ativa", "info");
 						return;
 					}
@@ -414,5 +418,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (session) teardown(undefined, ctx);
+		await echoCleanup.flush().catch(() => ctx.ui.notify("falha ao liberar módulo AEC no shutdown", "warning"));
 	});
 }

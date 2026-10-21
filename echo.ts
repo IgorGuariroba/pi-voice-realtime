@@ -8,6 +8,25 @@ import type { Backend } from './audio.ts';
 const exec = promisify(execFile);
 type Run = (args: string[]) => Promise<string>;
 const pactl: Run = async args => (await exec('pactl', args, { timeout: 5000 })).stdout;
+/** Retains ownership after unload failure; serializes overlapping cleanup requests. */
+export class EchoCleanup {
+ private readonly pending = new Set<{ close(): Promise<void> }>();
+ private running: Promise<void> | undefined;
+ add(handle: { close(): Promise<void> }): void { this.pending.add(handle); }
+ flush(): Promise<void> {
+  if (this.running) return this.running;
+  this.running = (async () => {
+   let failure: unknown;
+   for (const handle of this.pending) {
+    try { await handle.close(); this.pending.delete(handle); }
+    catch (error) { failure = error; }
+   }
+   if (failure) throw failure;
+  })().finally(() => { this.running = undefined; });
+  return this.running;
+ }
+}
+
 export interface EchoAudio {
  capture: Backend;
  playback: Backend;
