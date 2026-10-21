@@ -234,15 +234,15 @@ export default function (pi: ExtensionAPI, overrides: Partial<VoiceDeps> = {}) {
 		// Estado "connecting" até a sessão estar configurada; microfone só depois.
 		setStatus(ctx);
 
+		// realtime_start vai em `instructions` (como no Codex V2); item `developer` é recusado pela API.
 		const instructions = buildInstructions(
-			backendPrompt(process.env.USER || process.env.USERNAME),
+			`${backendPrompt(process.env.USER || process.env.USERNAME)}\n\n${START_INSTRUCTIONS}`,
 			buildStartupContext(ctx.sessionManager.getBranch(), ctx.cwd),
 		);
 		const current = new RealtimeSession({
 			apiKey,
 			settings,
 			instructions,
-			startItem: START_INSTRUCTIONS,
 			openSocket: deps.openSocket,
 			onEvent,
 			onClose: (reason) => {

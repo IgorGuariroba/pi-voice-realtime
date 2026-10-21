@@ -133,7 +133,7 @@ const backgroundAgent = (callId: string, prompt: string) => ({
 const messagesOf = (socket: { sent: any[] }) =>
 	socket.sent.filter((e) => e.type !== "session.update" && e.item?.role !== "developer");
 
-test("start envia instruções do Codex e o developer item de início", async () => {
+test("start envia instruções do Codex, com realtime_start em instructions e sem item developer", async () => {
 	const env = setup([
 		{ type: "message", message: { role: "user", content: "corrige o teste do parser" } },
 		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "feito" }] } },
@@ -143,8 +143,9 @@ test("start envia instruções do Codex e o developer item de início", async ()
 	assert.match(update.session.instructions, /## Identity, tone, and role/);
 	assert.match(update.session.instructions, /Diretório de trabalho: \/work\/projeto/);
 	assert.match(update.session.instructions, /\[USER\] corrige o teste do parser/);
-	const dev = env.socket.sent.find((e) => e.item?.role === "developer");
-	assert.match(dev.item.content[0].text, /^Realtime conversation started\./);
+	assert.match(update.session.instructions, /Realtime conversation started\./);
+	// a API recusa item com role developer em sessão realtime
+	assert.equal(env.socket.sent.find((e) => e.item?.role === "developer"), undefined);
 });
 
 test("background_agent ocioso inicia o turno com envelope de delegação, sem output ainda", async () => {
