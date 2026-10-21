@@ -18,7 +18,8 @@
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { Player, Recorder, captureBackend, playBackend, rmsLevel } from "./audio.ts";
+import { Player, Recorder, rmsLevel } from "./audio.ts";
+import { openEchoAudio, type EchoAudio } from "./echo.ts";
 import {
 	VOICES,
 	loadSettings,
@@ -40,6 +41,7 @@ export default function (pi: ExtensionAPI) {
 	let session: RealtimeSession | undefined;
 	let recorder: Recorder | undefined;
 	let player: Player | undefined;
+	let echoAudio: EchoAudio | undefined;
 	let muted = false;
 	let speaking = false;
 	let pendingDelegations = 0;
@@ -78,6 +80,9 @@ export default function (pi: ExtensionAPI) {
 		recorder = undefined;
 		player?.dispose();
 		player = undefined;
+		const oldEcho = echoAudio;
+		echoAudio = undefined;
+		void oldEcho?.close().catch(() => ctx.ui.notify("falha ao liberar módulo AEC", "warning"));
 		speaking = false;
 		pendingDelegations = 0;
 		view = { phase: "listening", level: 0, speaking: false };
@@ -149,11 +154,21 @@ export default function (pi: ExtensionAPI) {
 		if (session !== current) return;
 
 		try {
-			player = new Player(playBackend(process.platform, settings.outputDevice), (error) =>
-				ctx.ui.notify(`player: ${error.message}`, "error"),
-			);
+			if (settings.inputDevice || settings.outputDevice) {
+				throw new Error("AEC usa os dispositivos padrão PulseAudio/PipeWire; remova inputDevice/outputDevice de voice.json");
+			}
+			const routes = await openEchoAudio();
+			if (session !== current) {
+				await routes.close();
+				return;
+			}
+			echoAudio = routes;
+			player = new Player(routes.playback, (error) => {
+				if (session === current) teardown(`player: ${error.message}`, ctx);
+			});
 			recorder = new Recorder({
 				onFrame: (frame) => {
+					if (session !== current) return;
 					current.appendAudio(frame);
 					view = { ...view, level: rmsLevel(frame) };
 				},
@@ -163,8 +178,9 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 			recorder.setMuted(muted);
-			recorder.start(captureBackend(process.platform, settings.inputDevice));
+			recorder.start(routes.capture);
 		} catch (error) {
+			if (session !== current) return;
 			teardown(`falha ao iniciar áudio: ${(error as Error).message}`, ctx);
 			return;
 		}
