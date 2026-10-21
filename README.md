@@ -12,6 +12,18 @@ Conversa por voz full-duplex com o agente, no mesmo desenho do `/voice` do
   → o modelo de voz resume em 1–3 frases faladas
 ```
 
+## Instalação
+
+Requer Linux com PulseAudio/PipeWire, `pactl`, `parec`, `pacat` e suporte ao
+`module-echo-cancel` WebRTC, além de uma credencial OpenAI com acesso à API Realtime.
+
+```bash
+pi install npm:pi-voice-realtime
+```
+
+Reinicie o pi ou execute `/reload`, depois `/voice`.
+Para atualizar uma instalação npm existente, execute `pi update --extensions`.
+
 ## Uso
 
 | Comando / tecla | Efeito |
@@ -23,7 +35,7 @@ Conversa por voz full-duplex com o agente, no mesmo desenho do `/voice` do
 | `/voice settings` | escolhe a voz; ↑↓ toca a prévia (amostra gerada 1x e cacheada em `~/.pi/agent/voice/previews/`) (vale para a próxima sessão) |
 | `/voice status` | estado, voz, modelo, credencial, dispositivos |
 
-UI: widget acima do editor (`voice ● listening` / `mic ▂▃▅` / `f9 mute` /
+UI: widget acima do editor (`voice ● listening` / `mic ▁ ▂ ▄ ▆ █ ▅ ▃ ▂ ▁ ▁` / `f9 mute` /
 `/voice stop`) + linha no rodapé nativo, que segue mostrando tokens/git/modelo.
 Fala consolidada aparece no histórico e entra no contexto do agente como mensagem
 `[USER]` sem disparar turno (`sendMessage` sem `triggerTurn`), como o Codex grava
@@ -60,7 +72,8 @@ PCM16LE mono 24 kHz, frames de 20 ms (960 bytes). O caminho ativo requer
 Linux, `pactl`, `parec`, `pacat` e `module-echo-cancel` com WebRTC AEC.
 
 Cada sessão cria uma fonte tratada e um sink de referência com nomes únicos:
-`parec` lê a fonte; `pacat` envia toda a resposta ao sink. O módulo trata o eco
+`parec` lê a fonte com buffer de 30 ms para acompanhar a fala no medidor;
+`pacat` envia toda a resposta ao sink. O módulo trata o eco
 localmente e mantém full-duplex. Os dispositivos padrão globais não são alterados.
 Stop/falhas encerram os processos e solicitam o descarregamento do módulo.
 Se o AEC não carregar, a sessão não usa captura crua como fallback.
@@ -129,20 +142,13 @@ contexto de início e framing PCM.
 
 ## Estado da validação
 
-Comprovado: testes offline acima, carga no pi (`pi --help` sem erro),
-`/voice status` e `/voice` sem credencial executando via RPC, captura real com
-`arecord` (frames de 960 bytes, RMS coerente, stop limpo) e reprodução real com
-`aplay`, resolução de transporte (`loadWs()` → `ws`).
+Comprovado: testes offline acima, conversa real com transcrição e resposta falada
+no pi, e validação visual do medidor. A captura real pelo caminho AEC entregou
+blocos a cada 27–32 ms após a inicialização, com o buffer configurado em 30 ms.
 
-**Bloqueio atual:** a chave em `~/.pi/agent/auth.json` recebe `You have no credits
-remaining` do servidor. O handshake autentica; o E2E de `session.update` e do handoff
-depende de crédito.
-
-**Não comprovado** (exige crédito na API): aceitação do payload `session.update`,
-payload aceito pelo servidor, eventos de áudio/transcrição, barge-in contra o
-servidor, reconexão, sincronismo do áudio e o ciclo completo
-fala → delegação → resposta falada. Esses pontos só podem ser considerados
-prontos depois de um E2E real.
+Ainda pendentes de validação E2E específica: qualidade acústica do cancelamento
+de eco, barge-in contra o servidor e o ciclo completo de delegação
+fala → tarefa do agente → resposta falada.
 
 ## Limites conhecidos
 

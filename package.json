@@ -1,7 +1,15 @@
 {
 	"name": "pi-voice-realtime",
-	"version": "0.1.0-alpha.0",
+	"version": "0.1.0-alpha.1",
 	"description": "/voice para o pi: conversa por voz full-duplex (OpenAI Realtime), no desenho do /voice do Codex CLI. Alpha, Linux-only.",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/IgorGuariroba/pi-voice-realtime.git"
+	},
+	"homepage": "https://github.com/IgorGuariroba/pi-voice-realtime#readme",
+	"bugs": {
+		"url": "https://github.com/IgorGuariroba/pi-voice-realtime/issues"
+	},
 	"engines": {
 		"node": ">=22.6"
 	},
@@ -28,6 +36,7 @@
 		"README.md",
 		"LICENSE",
 		"GLOSSARY.md",
+		"prompts/**",
 		"docs/**"
 	],
 	"pi": {

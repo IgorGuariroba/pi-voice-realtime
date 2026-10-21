@@ -22,6 +22,7 @@ test('AEC owns a paired capture/playback route and unloads once', { skip: proces
  const run = async (args: string[]) => { calls.push(args); return args[0] === 'load-module' ? '123\n' : ''; };
  const audio = await openEchoAudio(run);
  assert.equal(audio.capture.command, 'parec');
+ assert.ok(audio.capture.args.includes('--latency-msec=30'));
  assert.equal(audio.playback.command, 'pacat');
  assert.ok(calls[0].includes('aec_method=webrtc'));
  const source = calls[0].find(a => a.startsWith('source_name='))!.split('=')[1];

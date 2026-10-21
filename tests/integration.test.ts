@@ -69,6 +69,7 @@ afterEach(() => {
 function setup(branch: any[] = []) {
 	const pi = fakePi();
 	let handlers: any;
+	let recorderHandlers: any;
 	const socket = {
 		sent: [] as any[],
 		transport: { impl: "ws", authMode: "header" },
@@ -107,10 +108,13 @@ function setup(branch: any[] = []) {
 	voiceExtension(pi as any, {
 		openSocket,
 		openEcho: async () => ({ capture: {}, playback: {}, close: async () => {} }),
-		createRecorder: () => ({ start() {}, stop() {}, setMuted() {} }) as any,
+		createRecorder: (handlers: any) => {
+			recorderHandlers = handlers;
+			return { start() {}, stop() {}, setMuted() {} } as any;
+		},
 		createPlayer: () => ({ write() {}, stop() {}, dispose() {} }) as any,
 	} as any);
-	return { pi, socket, server, ctx };
+	return { pi, socket, server, ctx, micFrame: (frame: Buffer) => recorderHandlers.onFrame(frame) };
 }
 
 async function startVoice(env: ReturnType<typeof setup>) {
@@ -206,4 +210,28 @@ test("fala do usuário vai ao histórico do pi sem disparar turno", async () => 
 	assert.equal(env.pi.custom[0].message.display, false);
 	assert.equal(env.pi.custom[0].options, undefined, "sem triggerTurn");
 	assert.deepEqual(env.pi.entries.map((e) => e.data.text), ["explica o módulo de áudio"]);
+});
+
+
+test("onda do mic tolera tick sem frame e decai quando a captura para", async (t) => {
+ const env = setup();
+ let widget: any;
+ t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1000 });
+ env.ctx.ui.setWidget = (_key: any, factory: any) => {
+  widget?.dispose();
+  widget = factory?.({ requestRender() {} }, theme);
+ };
+ try {
+  await startVoice(env);
+  const frame = Buffer.alloc(960);
+  for (let i = 0; i < frame.length; i += 2) frame.writeInt16LE(1300, i);
+  env.micFrame(frame);
+  t.mock.timers.tick(60);
+  assert.match(widget.render(80).slice(1).join(""), /[▂-█]/);
+  t.mock.timers.tick(1800);
+  assert.doesNotMatch(widget.render(80).slice(1).join(""), /[▂-█]/);
+ } finally {
+  await env.pi.command("voice").handler("stop", env.ctx);
+  widget?.dispose();
+ }
 });

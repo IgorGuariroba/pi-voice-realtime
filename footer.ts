@@ -27,16 +27,19 @@ export interface VoiceViewState {
 }
 
 const BLOCKS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-const WAVE_MS = 60;
+const WAVE_MS = 30;
 /** Quantidade de barras por onda. */
 const BARS = 10;
 /** Piso do medidor (dB). Ruído de fundo fica abaixo; fala típica sobe até ~-20 dB. */
 const FLOOR_DB = -55;
 /** Topo do medidor (dB): acima disso a barra fica cheia. */
 const CEIL_DB = -12;
+/** Mic captado (medido com a fala do usuário): ruído ~-48..-43 dB, fala típica -45..-30 dB, pico ~-22 dB. */
+const MIC_FLOOR_DB = -48;
+const MIC_CEIL_DB = -28;
 /** Subida rápida (ataque) e queda suave (liberação) para a barra não "tremer". */
 const ATTACK = 0.75;
-const RELEASE = 0.3;
+const RELEASE = 0.15;
 /** Ganho automático: referência mínima, queda do pico por tick e porta de ruído (RMS). */
 const REF_MIN = 0.003;
 const PEAK_DECAY = 0.985;
@@ -44,9 +47,18 @@ const GATE = 0.0015;
 
 /** Mapeia RMS linear (0..1) para 0..1 em escala logarítmica, perceptual. */
 export function levelToUnit(level: number): number {
+	return dbToUnit(level, FLOOR_DB, CEIL_DB);
+}
+
+/** Mesma escala logarítmica, com piso/topo do microfone. */
+export function micLevelToUnit(level: number): number {
+	return dbToUnit(level, MIC_FLOOR_DB, MIC_CEIL_DB);
+}
+
+function dbToUnit(level: number, floorDb: number, ceilDb: number): number {
 	if (!(level > 0)) return 0;
 	const db = 20 * Math.log10(level);
-	return Math.max(0, Math.min(1, (db - FLOOR_DB) / (CEIL_DB - FLOOR_DB)));
+	return Math.max(0, Math.min(1, (db - floorDb) / (ceilDb - floorDb)));
 }
 
 /**
@@ -70,6 +82,25 @@ export class AutoGain {
 export function envelope(prev: number, target: number): number {
 	const k = target > prev ? ATTACK : RELEASE;
 	return prev + (target - prev) * k;
+}
+
+/**
+ * Onda em duas linhas (16 níveis): a linha de cima só enche depois que a de baixo está cheia.
+ * Retorna [linhaDeCima, linhaDeBaixo], ambas com `width` colunas, mais recente à direita.
+ */
+export function waveRows(history: readonly number[], width: number): [string, string] {
+	const start = Math.max(0, history.length - width);
+	const pad = width - (history.length - start);
+	let top = " ".repeat(pad);
+	let bottom = " ".repeat(pad);
+	for (let i = start; i < history.length; i++) {
+		const total = Math.round(Math.max(0, Math.min(1, history[i])) * 16);
+		const low = Math.min(8, total);
+		const high = Math.max(0, total - 8);
+		bottom += low === 0 ? " " : BLOCKS[low - 1];
+		top += high === 0 ? " " : BLOCKS[high - 1];
+	}
+	return [top, bottom];
 }
 
 /** Uma barra por amostra (0..1), mais recente à direita; preenche com `▁` à esquerda. */
@@ -111,13 +142,9 @@ export function statusText(state: VoiceViewState, theme: Theme): string {
 
 class VoiceWidget implements Component {
 	private timer: ReturnType<typeof setInterval> | undefined;
-	/** Histórico do microfone, uma amostra por tick. */
 	private readonly micHistory: number[] = [];
-	/** Histórico do áudio do agente, uma amostra por tick. */
 	private readonly outHistory: number[] = [];
 	private micEnv = 0;
-	private readonly micGain = new AutoGain();
-	private readonly outGain = new AutoGain();
 	private outEnv = 0;
 	private readonly state: () => VoiceViewState;
 	private readonly tui: TUI;
@@ -130,9 +157,15 @@ class VoiceWidget implements Component {
 		this.timer = setInterval(() => {
 			const s = this.state();
 			const mic = s.takeMicLevel?.() ?? 0;
-			const micTarget = s.phase === "muted" ? 0 : this.micGain.unit(mic);
-			const outTarget = s.speaking ? this.outGain.unit(s.outLevelAt?.(Date.now()) ?? 0) : 0;
-			this.micEnv = envelope(this.micEnv, micTarget);
+			// Mapeia dB absoluto: normalizar pelo pico (AutoGain) achata tudo em barra cheia.
+			const micTarget = s.phase === "muted" ? 0 : micLevelToUnit(mic);
+			const outTarget = s.speaking ? levelToUnit(s.outLevelAt?.(Date.now()) ?? 0) : 0;
+			if (s.phase === "muted") {
+				this.micHistory.length = 0;
+				this.micEnv = 0;
+			} else {
+				this.micEnv = envelope(this.micEnv, micTarget);
+			}
 			this.outEnv = envelope(this.outEnv, outTarget);
 			push(this.micHistory, this.micEnv);
 			push(this.outHistory, this.outEnv);
@@ -157,24 +190,24 @@ class VoiceWidget implements Component {
 		const hintMute = state.phase === "muted" ? "f9 unmute" : "f9 mute";
 		const right =
 			theme.fg("dim", hintMute) + theme.fg("muted", "   ") + theme.fg("dim", "/voice stop");
-		const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
+		const pad = " ".repeat(Math.max(1, width - 2 - visibleWidth(left) - visibleWidth(right)));
 
-		const mic =
-			state.phase === "muted"
-				? theme.fg("dim", `mic ${wave([], BARS)}`)
-				: `${theme.fg("muted", "mic")} ${theme.fg("accent", wave(this.micHistory, BARS))}`;
-		const codex = state.speaking
-			? `   ${theme.fg("muted", "pi")} ${theme.fg("accent", wave(this.outHistory, BARS))}`
+		const micMuted = state.phase === "muted";
+		// Barras separadas mostram o histórico recente da fala.
+		const micBars = wave(micMuted ? [] : this.micHistory, BARS).split("").join(" ");
+		const mic = `${theme.fg("muted", "mic")}  ${theme.fg(micMuted ? "dim" : "accent", micBars)}`;
+		const out = state.speaking
+			? `    ${theme.fg("muted", "pi")}  ${theme.fg("accent", wave(this.outHistory, BARS).split("").join(" "))}`
 			: "";
-		const detail = mic + codex;
-
-		const caption = state.caption
-			? theme.fg("dim", `  ${truncateToWidth(state.caption, Math.max(10, width - 30))}`)
+		const detail = `  ${mic}${out}`;
+		const captionWidth = Math.max(0, width - visibleWidth(detail) - 3);
+		const caption = state.caption && captionWidth > 0
+			? theme.fg("dim", `   ${truncateToWidth(state.caption, captionWidth)}`)
 			: "";
 
 		return [
 			truncateToWidth(`  ${left}${pad}${right}`, width),
-			truncateToWidth(`    ${detail}${caption}`, width),
+			truncateToWidth(`${detail}${caption}`, width),
 		];
 	}
 }

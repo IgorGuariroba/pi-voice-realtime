@@ -76,10 +76,12 @@ export default function (pi: ExtensionAPI, overrides: Partial<VoiceDeps> = {}) {
 	/** Há um run do pi em andamento (agent_start → agent_end). */
 	let agentRunning = false;
 	let view: VoiceViewState = { phase: "listening", speaking: false };
-	/** Pico do microfone desde a última amostra da onda. */
-	// Mesma régra do áudio do agente: RMS médio por janela de 60 ms (não pico de frame).
+	/** Nível médio do microfone desde a última amostra da onda. */
+	// RMS médio dos frames de 20 ms recebidos desde o último tick da onda (30 ms).
 	let micSum = 0;
 	let micCount = 0;
+	let micLast = 0;
+	let micLastAt = 0;
 	/** Segmentos de áudio do agente, com o instante em que devem tocar. */
 	let outSchedule: Array<{ at: number; level: number }> = [];
 	/** Instante (ms epoch) em que o áudio já enfileirado termina de tocar. */
@@ -102,10 +104,12 @@ export default function (pi: ExtensionAPI, overrides: Partial<VoiceDeps> = {}) {
 	};
 
 	const takeMicLevel = () => {
-		const level = micCount ? micSum / micCount : 0;
+		// Com tick de 30 ms e frames de 20 ms, alguns ticks chegam sem frame novo: mantém o último nível em vez de zerar (evita piscar).
+		if (micCount) micLast = micSum / micCount;
 		micSum = 0;
 		micCount = 0;
-		return level;
+		// Tolera ticks sem frame, mas não mantém a onda congelada se a captura parar.
+		return Date.now() - micLastAt < 150 ? micLast : 0;
 	};
 
 	/** Maior nível dos segmentos que já deveriam estar tocando em `at`. */
@@ -184,6 +188,8 @@ export default function (pi: ExtensionAPI, overrides: Partial<VoiceDeps> = {}) {
 		playhead = 0;
 		micSum = 0;
 		micCount = 0;
+		micLast = 0;
+		micLastAt = 0;
 		view = { phase: "listening", speaking: false };
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -195,6 +201,10 @@ export default function (pi: ExtensionAPI, overrides: Partial<VoiceDeps> = {}) {
 		muted = !muted;
 		// Mutar afeta só a captura: o Codex continua reproduzindo a resposta.
 		recorder?.setMuted(muted);
+		micSum = 0;
+		micCount = 0;
+		micLast = 0;
+		micLastAt = 0;
 		view = { ...view, phase: muted ? "muted" : speaking ? "speaking" : "listening", speaking };
 		refresh();
 		setStatus(ctx);
@@ -220,6 +230,8 @@ export default function (pi: ExtensionAPI, overrides: Partial<VoiceDeps> = {}) {
 		view = { phase: "starting", speaking: false };
 		micSum = 0;
 		micCount = 0;
+		micLast = 0;
+		micLastAt = 0;
 		outSchedule = [];
 		playhead = 0;
 
@@ -283,6 +295,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<VoiceDeps> = {}) {
 					current.appendAudio(frame);
 					micSum += rmsLevel(frame);
 					micCount++;
+					micLastAt = Date.now();
 				},
 				onError: (error) => {
 					ctx.ui.notify(`microfone: ${error.message}`, "error");
