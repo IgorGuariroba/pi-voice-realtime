@@ -20,7 +20,7 @@ Conversa por voz full-duplex com o agente, no mesmo desenho do `/voice` do
 | `/voice stop` | encerra a sessão e libera mic/player |
 | `/voice mute` / `unmute` | microfone (não afeta a reprodução) |
 | `f9` | alterna mute |
-| `/voice settings` | escolhe a voz (vale para a próxima sessão) |
+| `/voice settings` | escolhe a voz; ↑↓ toca a prévia (amostra gerada 1x e cacheada em `~/.pi/agent/voice/previews/`) (vale para a próxima sessão) |
 | `/voice status` | estado, voz, modelo, credencial, dispositivos |
 
 UI: widget acima do editor (`voice ● listening` / `mic ▂▃▅` / `f9 mute` /

@@ -17,8 +17,11 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { Player, Recorder, rmsLevel } from "./audio.ts";
+import { SelectList, Text } from "@earendil-works/pi-tui";
+import type { ChildProcess } from "node:child_process";
+import { BYTES_PER_SAMPLE, Player, Recorder, rmsLevel } from "./audio.ts";
+import { SAMPLE_RATE } from "./config.ts";
+import { ensurePreview, playPreviewFile } from "./previews.ts";
 import { openEchoAudio, EchoCleanup, type EchoAudio } from "./echo.ts";
 import {
 	VOICES,
@@ -46,7 +49,16 @@ export default function (pi: ExtensionAPI) {
 	let muted = false;
 	let speaking = false;
 	let pendingDelegations = 0;
-	let view: VoiceViewState = { phase: "listening", level: 0, speaking: false };
+	let view: VoiceViewState = { phase: "listening", speaking: false };
+	/** Pico do microfone desde a última amostra da onda. */
+	// Mesma régra do áudio do agente: RMS médio por janela de 60 ms (não pico de frame).
+	let micSum = 0;
+	let micCount = 0;
+	/** Segmentos de áudio do agente, com o instante em que devem tocar. */
+	let outSchedule: Array<{ at: number; level: number }> = [];
+	/** Instante (ms epoch) em que o áudio já enfileirado termina de tocar. */
+	let playhead = 0;
+	let speakingTimer: ReturnType<typeof setTimeout> | undefined;
 	// O widget anima por conta própria (timer de 60 ms chamando tui.requestRender);
 	// aqui só atualizamos o estado. O rodapé é atualizado por setStatus().
 	const refresh = () => {};
@@ -61,6 +73,49 @@ export default function (pi: ExtensionAPI) {
 	const caption = (text: string | undefined) => {
 		view = { ...view, caption: text ? text.replace(/\s+/g, " ").slice(0, 120) : undefined };
 		refresh();
+	};
+
+	const takeMicLevel = () => {
+		const level = micCount ? micSum / micCount : 0;
+		micSum = 0;
+		micCount = 0;
+		return level;
+	};
+
+	/** Maior nível dos segmentos que já deveriam estar tocando em `at`. */
+	const outLevelAt = (at: number) => {
+		let level = 0;
+		while (outSchedule.length && outSchedule[0].at <= at) level = Math.max(level, outSchedule.shift()!.level);
+		return level;
+	};
+
+	const scheduleOutput = (pcm: Buffer) => {
+		const bytesPerMs = (SAMPLE_RATE * BYTES_PER_SAMPLE) / 1000;
+		const segment = Math.floor(bytesPerMs * 60) & ~1;
+		let at = Math.max(Date.now(), playhead);
+		for (let off = 0; off < pcm.length; off += segment) {
+			const chunk = pcm.subarray(off, Math.min(pcm.length, off + segment));
+			outSchedule.push({ at, level: rmsLevel(chunk) });
+			at += chunk.length / bytesPerMs;
+		}
+		playhead = at;
+	};
+
+	/** Só encerra "speaking" quando o áudio enfileirado terminou de tocar localmente. */
+	const endSpeakingWhenPlayed = (ctx: ExtensionContext) => {
+		if (speakingTimer) clearTimeout(speakingTimer);
+		speakingTimer = setTimeout(() => {
+			speakingTimer = undefined;
+			speaking = false;
+			outSchedule = [];
+			view = {
+				...view,
+				phase: pendingDelegations > 0 ? "working" : muted ? "muted" : "listening",
+				speaking: false,
+			};
+			refresh();
+			setStatus(ctx);
+		}, Math.max(0, playhead - Date.now()) + 100);
 	};
 
 	const setStatus = (ctx: ExtensionContext) => {
@@ -87,7 +142,13 @@ export default function (pi: ExtensionAPI) {
 		void echoCleanup.flush().catch(() => ctx.ui.notify("falha ao liberar módulo AEC; limpeza será tentada novamente", "warning"));
 		speaking = false;
 		pendingDelegations = 0;
-		view = { phase: "listening", level: 0, speaking: false };
+		if (speakingTimer) clearTimeout(speakingTimer);
+		speakingTimer = undefined;
+		outSchedule = [];
+		playhead = 0;
+		micSum = 0;
+		micCount = 0;
+		view = { phase: "listening", speaking: false };
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		if (reason) ctx.ui.notify(`voz encerrada: ${reason}`, "warning");
@@ -120,10 +181,16 @@ export default function (pi: ExtensionAPI) {
 
 		settings = loadSettings();
 		muted = settings.muteOnStart;
-		view = { phase: "starting", level: 0, speaking: false };
+		view = { phase: "starting", speaking: false };
+		micSum = 0;
+		micCount = 0;
+		outSchedule = [];
+		playhead = 0;
 
 		if (ctx.mode === "tui") {
-			ctx.ui.setWidget(WIDGET_KEY, createVoiceWidget(() => view), { placement: "aboveEditor" });
+			ctx.ui.setWidget(WIDGET_KEY, createVoiceWidget(() => ({ ...view, takeMicLevel, outLevelAt })), {
+				placement: "aboveEditor",
+			});
 		}
 
 		const onEvent = (event: VoiceEvent) => handleEvent(event, ctx);
@@ -173,7 +240,8 @@ export default function (pi: ExtensionAPI) {
 				onFrame: (frame) => {
 					if (session !== current) return;
 					current.appendAudio(frame);
-					view = { ...view, level: rmsLevel(frame) };
+					micSum += rmsLevel(frame);
+					micCount++;
 				},
 				onError: (error) => {
 					ctx.ui.notify(`microfone: ${error.message}`, "error");
@@ -215,6 +283,11 @@ export default function (pi: ExtensionAPI) {
 			case "audio":
 				if (muted) break;
 				player?.write(event.pcm);
+				scheduleOutput(event.pcm);
+				if (speakingTimer) {
+					clearTimeout(speakingTimer);
+					speakingTimer = undefined;
+				}
 				if (!speaking) speak("");
 				break;
 
@@ -222,13 +295,17 @@ export default function (pi: ExtensionAPI) {
 				// Barge-in: como o Codex, cancela a resposta no servidor e corta o áudio local.
 				session?.cancelResponse();
 				speaking = false;
+				if (speakingTimer) clearTimeout(speakingTimer);
+				speakingTimer = undefined;
+				outSchedule = [];
+				playhead = 0;
 				player?.stop();
 				view = { ...view, phase: "listening", speaking: false };
 				refresh();
 				break;
 
 			case "speech_stopped":
-				view = { ...view, phase: pendingDelegations > 0 ? "working" : "listening", level: 0 };
+				view = { ...view, phase: pendingDelegations > 0 ? "working" : "listening" };
 				refresh();
 				break;
 
@@ -245,13 +322,8 @@ export default function (pi: ExtensionAPI) {
 				break;
 
 			case "response_done":
-				speaking = false;
-				view = {
-					...view,
-					phase: pendingDelegations > 0 ? "working" : muted ? "muted" : "listening",
-					speaking: false,
-				};
-				refresh();
+				// A geração terminou, mas o áudio ainda pode estar tocando: a onda segue até o fim.
+				endSpeakingWhenPlayed(ctx);
 				break;
 
 			case "error": {
@@ -345,10 +417,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	async function openSettings(ctx: ExtensionCommandContext) {
-		const choice = await ctx.ui.select(
-			`Voz da conversa (atual: ${settings.voice})`,
-			[...VOICES],
-		);
+		const choice = await pickVoice(ctx);
 		if (!choice) return;
 		settings = { ...settings, voice: choice as VoiceName };
 		saveSettings(settings);
@@ -356,6 +425,78 @@ export default function (pi: ExtensionAPI) {
 			`voz definida para ${choice} — vale para a próxima sessão (/voice stop e /voice)`,
 			"info",
 		);
+	}
+
+	/**
+	 * Seletor de voz com prévia: ao mudar o cursor, toca a amostra da voz
+	 * (gerada uma vez e guardada em cache). Enter confirma, Esc cancela.
+	 */
+	function pickVoice(ctx: ExtensionCommandContext): Promise<VoiceName | undefined> {
+		return ctx.ui.custom<VoiceName | undefined>((_tui, theme, _kb, done) => {
+			let current: ChildProcess | undefined;
+			let seq = 0;
+			let warned = false;
+
+			const stopPlayback = () => {
+				current?.kill();
+				current = undefined;
+			};
+
+			const preview = async (voice: VoiceName) => {
+				const mine = ++seq;
+				stopPlayback();
+				const key = resolveApiKey();
+				if (!key) {
+					if (!warned) ctx.ui.notify("prévia indisponível: credencial OpenAI ausente", "warning");
+					warned = true;
+					return;
+				}
+				try {
+					const path = await ensurePreview(voice, key);
+					if (mine !== seq) return; // cursor já mudou
+					current = playPreviewFile(path);
+				} catch (error) {
+					if (!warned) ctx.ui.notify(String((error as Error).message ?? error), "warning");
+					warned = true;
+				}
+			};
+
+			const list = new SelectList(
+				VOICES.map((v) => ({ value: v, label: v, description: v === settings.voice ? "atual" : undefined })),
+				VOICES.length,
+				{
+					selectedPrefix: (t) => theme.fg("accent", t),
+					selectedText: (t) => theme.fg("accent", t),
+					description: (t) => theme.fg("dim", t),
+					scrollInfo: (t) => theme.fg("dim", t),
+					noMatch: (t) => theme.fg("warning", t),
+				},
+			);
+			const initial = Math.max(0, VOICES.indexOf(settings.voice));
+			list.setSelectedIndex(initial);
+			list.onSelectionChange = (item) => void preview(item.value as VoiceName);
+			list.onSelect = (item) => {
+				stopPlayback();
+				done(item.value as VoiceName);
+			};
+			list.onCancel = () => {
+				stopPlayback();
+				done(undefined);
+			};
+
+			return {
+				render: (width: number) => [
+					theme.fg("accent", `Voz da conversa (atual: ${settings.voice}) — ↑↓ ouvir prévia · enter escolhe · esc cancela`),
+					...list.render(width),
+				],
+				handleInput: (data: string) => list.handleInput(data),
+				invalidate: () => list.invalidate?.(),
+				dispose: () => {
+					seq++;
+					stopPlayback();
+				},
+			};
+		});
 	}
 
 	pi.registerShortcut("f9", {
