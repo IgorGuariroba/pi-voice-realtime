@@ -70,8 +70,8 @@ test("payload V2 declara background_agent e remain_silent com os nomes do Codex"
 	assert.equal(tools[0].parameters.additionalProperties, false);
 });
 
-test("modelo default é o do Codex", () => {
-	assert.equal(DEFAULT_SETTINGS.model, "gpt-realtime-1.5");
+test("modelo default prioriza custo-benefício", () => {
+	assert.equal(DEFAULT_SETTINGS.model, "gpt-realtime-2.1-mini");
 });
 
 test("instruções: backend prompt do Codex, com contexto de início quando houver", () => {

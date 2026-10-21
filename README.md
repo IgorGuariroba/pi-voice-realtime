@@ -65,7 +65,7 @@ ambiente servem para uso temporário ou CI.
 `~/.pi/agent/voice.json` (criado ao escolher a voz em `/voice settings`):
 
 ```json
-{ "voice": "marin", "model": "gpt-realtime-1.5", "muteOnStart": false }
+{ "voice": "marin", "model": "gpt-realtime-2.1-mini", "muteOnStart": false }
 ```
 
 O caminho AEC atual usa os dispositivos padrão PulseAudio/PipeWire. Remova

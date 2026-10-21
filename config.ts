@@ -32,7 +32,7 @@ export type VoiceName = (typeof VOICES)[number];
 export interface VoiceSettings {
 	/** Voz falada pelo modelo realtime. */
 	voice: VoiceName;
-	/** Modelo realtime. Codex default: `gpt-realtime-1.5`. */
+	/** Modelo realtime; mini oferece voz em tempo real com menor custo. */
 	model: string;
 	/** Nome/dispositivo ALSA de entrada (`arecord -D`). */
 	inputDevice?: string;
@@ -44,7 +44,7 @@ export interface VoiceSettings {
 
 export const DEFAULT_SETTINGS: VoiceSettings = {
 	voice: "marin",
-	model: "gpt-realtime-1.5",
+	model: "gpt-realtime-2.1-mini",
 	inputDevice: undefined,
 	outputDevice: undefined,
 	muteOnStart: false,
