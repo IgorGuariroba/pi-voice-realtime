@@ -1,7 +1,10 @@
 /** Testes do medidor de voz: escala perceptual, onda com histórico e largura fixa. */
 import assert from "node:assert/strict";
+import { register } from "node:module";
 import { test } from "node:test";
-import { AutoGain, envelope, levelToUnit, meter, wave } from "../footer.ts";
+
+register("./stub-hooks.mjs", import.meta.url);
+const { AutoGain, envelope, levelToUnit, meter, wave } = await import("../footer.ts");
 
 test("fala típica (RMS 0.02–0.1) gera barras acima do piso", () => {
 	for (const rms of [0.02, 0.05, 0.1]) assert.ok(levelToUnit(rms) > 0.2, `rms ${rms}`);

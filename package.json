@@ -2,11 +2,27 @@
 	"name": "pi-voice-realtime",
 	"version": "0.1.0-alpha.0",
 	"description": "/voice para o pi: conversa por voz full-duplex (OpenAI Realtime), no desenho do /voice do Codex CLI. Alpha, Linux-only.",
-	"keywords": ["pi-package", "pi", "voice", "realtime", "openai", "speech"],
+	"engines": {
+		"node": ">=22.6"
+	},
+	"scripts": {
+		"test": "node --test --experimental-strip-types tests/*.test.ts",
+		"test:unit": "node --test --experimental-strip-types $(ls tests/*.test.ts | grep -v integration)"
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"voice",
+		"realtime",
+		"openai",
+		"speech"
+	],
 	"license": "MIT",
 	"private": false,
 	"type": "module",
-	"os": ["linux"],
+	"os": [
+		"linux"
+	],
 	"files": [
 		"*.ts",
 		"README.md",
@@ -15,7 +31,9 @@
 		"docs/**"
 	],
 	"pi": {
-		"extensions": ["./index.ts"]
+		"extensions": [
+			"./index.ts"
+		]
 	},
 	"dependencies": {
 		"ws": "^8.18.0"
@@ -28,7 +46,11 @@
 		"typebox": "*"
 	},
 	"peerDependenciesMeta": {
-		"@earendil-works/pi-agent-core": { "optional": true },
-		"typebox": { "optional": true }
+		"@earendil-works/pi-agent-core": {
+			"optional": true
+		},
+		"typebox": {
+			"optional": true
+		}
 	}
 }
