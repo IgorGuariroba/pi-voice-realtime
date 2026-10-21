@@ -1,21 +1,31 @@
 # Glossário — /voice
 
-**Sessão do pi**: o agente. Concentra contexto, decisões, ferramentas e guardas. É a única cabeça da conversa.
+**Sessão realtime**: conexão com o modelo de voz (`/v1/realtime`, protocolo V2 do Codex). Fala, escuta e decide quando delegar.
 
-**Voz**: o canal de entrada e saída de áudio. Não raciocina nem decide.
+**Modelo de voz**: o modelo realtime. Conversa com o usuário e, para qualquer trabalho, chama `background_agent`. Não executa ferramentas de código.
 
-**Transcrição**: converte a fala do usuário em texto. Só a transcrição consolidada vira mensagem; parciais ficam apenas na interface.
+**Agente**: o turno normal do pi, com as mesmas ferramentas, sandbox e permissões da sessão.
 
-**Síntese de voz**: converte em áudio um texto fornecido pela sessão do pi. Não reformula, não responde.
+**background_agent**: ferramenta do modelo de voz que envia o pedido do usuário ao agente, sem reescrevê-lo. Ocioso, inicia tarefa; ocupado, faz steer.
 
-**Mensagem de voz**: mensagem de usuário na sessão do pi, originada de uma transcrição consolidada e marcada como voz.
+**remain_silent**: ferramenta do modelo de voz para não falar (ex.: após mensagens de controle).
 
-**Resumo falado**: texto curto (1 a 3 frases) produzido pela sessão do pi junto da resposta visual, lido pela síntese de voz.
+**Handoff**: uma chamada `background_agent` do início até a conclusão do run do agente.
 
-**Steer**: injeção de uma instrução na execução em curso. Falar interrompe a reprodução de áudio, mas não cancela a execução; cancelar exige instrução explícita.
+**Steer**: nova instrução enviada à tarefa em execução. A chamada original continua até o fim; a nova recebe só o ack.
 
-**Decisão pendente**: pedido de aprovação do pi no terminal. A voz apenas avisa; não interpreta "sim" como autorização.
+**Envelope de delegação**: `<realtime_delegation><input>…</input></realtime_delegation>`, o texto que o agente recebe como turno.
 
-**Sessão em que a voz foi iniciada**: a voz fica presa à sessão do pi onde foi aberta. Não acompanha mudanças de foco.
+**[BACKEND]**: prefixo de item do modelo de voz com progresso ou resultado do agente. O modelo lê como mensagem de usuário, distinguível pelo prefixo.
 
-*Obsoleto*: "modelo realtime" descreve a implementação atual, não a responsabilidade. Use "transcrição" e "síntese de voz".
+**[USER]**: prefixo de fala consolidada no histórico do agente. Entra no contexto sem disparar turno.
+
+**Contexto de início**: turnos recentes do ramo do pi e diretório de trabalho, enviados como instruções da sessão (orçamento de 5 300 tokens).
+
+**Fila de response.create**: no máximo uma resposta do modelo por vez; pedidos enquanto há resposta ativa esperam o `response.done`.
+
+**Truncate**: `conversation.item.truncate` enviado no barge-in, com o tempo de áudio já emitido.
+
+**Voice owner**: a sessão do pi onde o `/voice` foi iniciado. Não acompanha mudanças de foco. (Codex: thread dona da voz.)
+
+*Obsoleto*: "ouvido", "boca", "transcrição só como entrada", "síntese de voz", "resumo falado" (ADR 0001).

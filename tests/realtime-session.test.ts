@@ -199,37 +199,7 @@ test("o dialeto da sessão chega ao handshake", async () => {
 	assert.deepEqual(seen, ["ga"]);
 });
 
-test("barge-in sem resposta ativa não envia response.cancel", async () => {
-	const transport = fakeTransport();
-	const { session } = makeSession(transport);
-	const connecting = session.connect();
-	await tick();
-	transport.open();
-	transport.message({ type: "session.updated" });
-	await connecting;
-
-	const before = transport.sent.length;
-	session.cancelResponse();
-	assert.equal(transport.sent.length, before, "nada a cancelar");
-});
-
-test("barge-in com resposta ativa envia response.cancel", async () => {
-	const transport = fakeTransport();
-	const { session } = makeSession(transport);
-	const connecting = session.connect();
-	await tick();
-	transport.open();
-	transport.message({ type: "session.updated" });
-	await connecting;
-
-	transport.message({ type: "response.created" });
-	const before = transport.sent.length;
-	session.cancelResponse();
-	assert.equal(transport.sent.length, before + 1);
-	assert.match(transport.sent[before], /response\.cancel/);
-});
-
-test("erro 'no active response' não vira erro para o usuário", async () => {
+async function readySession() {
 	const transport = fakeTransport();
 	const { session, events } = makeSession(transport);
 	const connecting = session.connect();
@@ -237,11 +207,44 @@ test("erro 'no active response' não vira erro para o usuário", async () => {
 	transport.open();
 	transport.message({ type: "session.updated" });
 	await connecting;
+	return { transport, session, events };
+}
 
-	events.length = 0;
-	transport.message({
-		type: "error",
-		error: { message: "Cancellation failed: no active response found" },
-	});
-	assert.equal(events.filter((e) => e.kind === "error").length, 0);
+test("barge-in trunca o áudio já emitido e não envia response.cancel", async () => {
+	const { transport } = await readySession();
+	// 48 000 bytes PCM16 a 24 kHz = 1000 ms de áudio.
+	transport.message({ type: "response.output_audio.delta", item_id: "item_9", delta: Buffer.alloc(48_000).toString("base64") });
+	transport.message({ type: "input_audio_buffer.speech_started" });
+	const truncate = transport.sent.map((s) => JSON.parse(s)).find((e) => e.type === "conversation.item.truncate");
+	assert.deepEqual(truncate, { type: "conversation.item.truncate", item_id: "item_9", content_index: 0, audio_end_ms: 1000 });
+	assert.ok(!transport.sent.some((s) => s.includes("response.cancel")), "o servidor cancela sozinho (interrupt_response)");
+});
+
+test("barge-in sem áudio emitido não trunca", async () => {
+	const { transport } = await readySession();
+	const before = transport.sent.length;
+	transport.message({ type: "input_audio_buffer.speech_started" });
+	assert.equal(transport.sent.length, before);
+});
+
+test("response.create enquanto há resposta ativa é adiado até response.done (fila de 1)", async () => {
+	const { transport, session } = await readySession();
+	transport.message({ type: "response.created" });
+	const before = transport.sent.length;
+	session.createResponse();
+	assert.equal(transport.sent.length, before, "não cria resposta em paralelo");
+	transport.message({ type: "response.done" });
+	const next = transport.sent.slice(before).map((s) => JSON.parse(s));
+	assert.deepEqual(next, [{ type: "response.create" }]);
+});
+
+test("function_call_output e item [BACKEND] seguem o formato do Codex", async () => {
+	const { transport, session } = await readySession();
+	const before = transport.sent.length;
+	session.functionCallOutput("call_1", "ok");
+	session.backendItem("resultado");
+	const [out, backend] = transport.sent.slice(before).map((s) => JSON.parse(s));
+	assert.deepEqual(out, { type: "conversation.item.create", item: { type: "function_call_output", call_id: "call_1", output: "ok" } });
+	assert.equal(backend.item.role, "user");
+	assert.equal(backend.item.content[0].text, "[BACKEND] resultado");
 });

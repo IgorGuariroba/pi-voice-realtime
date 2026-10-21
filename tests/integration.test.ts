@@ -1,16 +1,17 @@
 /**
- * Integração de index.ts com um contrato mockado do pi, socket realtime, microfone e player.
- * Cobre T2 (steer e interrupção pelo caminho completo), término estimado por timer real,
- * timer antigo que não reescreve interrupção, T4 (sem resposta autônoma) e T5 (decisão pendente).
- * Não prova escuta nem interrupção audível: isso é medido por captura de saída.
+ * Integração de index.ts com contrato mockado do pi, socket realtime, microfone e player.
+ * Cobre o ciclo do handoff da V2 (ADR 0002): background_agent, steer, remain_silent,
+ * resultado [BACKEND] + function_call_output + response.create, histórico sem turno
+ * e contexto de início.
  * Rodar: node --test --experimental-strip-types ~/.pi/agent/extensions/voice/tests/integration.test.ts
  */
 import assert from "node:assert/strict";
 import { register } from "node:module";
-import { afterEach, beforeEach, mock, test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 
 register("./stub-hooks.mjs", import.meta.url);
 const { default: voiceExtension } = await import("../index.ts");
+const { HANDOFF_COMPLETE_ACK, STEER_ACK } = await import("../delegation.ts");
 
 type Handler = (event: any, ctx: any) => unknown;
 
@@ -18,12 +19,12 @@ function fakePi() {
 	const handlers = new Map<string, Handler[]>();
 	const commands = new Map<string, { handler: (args: string, ctx: any) => unknown }>();
 	const sent: Array<{ text: string; deliverAs?: string }> = [];
-	let aborts = 0;
+	const custom: Array<{ message: any; options?: any }> = [];
+	const entries: Array<{ type: string; data: any }> = [];
 	return {
 		sent,
-		get aborts() {
-			return aborts;
-		},
+		custom,
+		entries,
 		on(name: string, handler: Handler) {
 			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
 			return () => {};
@@ -34,12 +35,14 @@ function fakePi() {
 		registerEntryRenderer() {},
 		registerMarkdownTransformer() {},
 		registerShortcut() {},
-		appendEntry() {},
+		appendEntry(type: string, data: any) {
+			entries.push({ type, data });
+		},
 		sendUserMessage(text: string, options?: { deliverAs?: string }) {
 			sent.push({ text, deliverAs: options?.deliverAs });
 		},
-		abort() {
-			aborts += 1;
+		sendMessage(message: any, options?: any) {
+			custom.push({ message, options });
 		},
 		async emit(name: string, event: any, ctx: any) {
 			for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
@@ -51,14 +54,19 @@ function fakePi() {
 }
 
 const theme = { fg: (_color: string, text: string) => text };
-const ctx = {
-	mode: "tui",
-	ui: { theme, notify() {}, setStatus() {}, setWidget() {}, custom() {} },
-};
-
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-function setup() {
+let savedKey: string | undefined;
+beforeEach(() => {
+	savedKey = process.env.OPENAI_API_KEY;
+	process.env.OPENAI_API_KEY = "sk-test-redacted";
+});
+afterEach(() => {
+	if (savedKey === undefined) delete process.env.OPENAI_API_KEY;
+	else process.env.OPENAI_API_KEY = savedKey;
+});
+
+function setup(branch: any[] = []) {
 	const pi = fakePi();
 	let handlers: any;
 	const socket = {
@@ -74,45 +82,39 @@ function setup() {
 	};
 	const openSocket = async (options: any) => {
 		handlers = options.handlers;
-		queueMicrotask(() => options.handlers.onOpen());
+		setImmediate(() => options.handlers.onOpen());
 		return socket;
 	};
-	let playerStops = 0;
-	const written: Buffer[] = [];
-	const player = {
-		write(pcm: Buffer) {
-			written.push(pcm);
+	const server = (event: Record<string, unknown>) => handlers.onMessage(JSON.stringify(event));
+	const ctx = {
+		mode: "tui",
+		cwd: "/work/projeto",
+		idle: true,
+		isIdle() {
+			return this.idle;
 		},
-		stop() {
-			playerStops += 1;
+		sessionManager: { getBranch: () => branch },
+		ui: {
+			theme,
+			notify(message: string, level?: string) {
+				if (globalThis.__VOICE_DEBUG__) console.log("NOTIFY", level, message);
+			},
+			setStatus() {},
+			setWidget() {},
+			custom() {},
 		},
-		dispose() {},
 	};
-	const observed: Array<{ id: string; text: string; state: string; fraction?: number }> = [];
-	const deps = {
-		apiKey: "sk-test-redacted",
+	voiceExtension(pi as any, {
 		openSocket,
 		openEcho: async () => ({ capture: {}, playback: {}, close: async () => {} }),
-		createRecorder: () => ({ start() {}, stop() {}, setMuted() {} }),
-		createPlayer: () => player,
-		observe: (record: any) => observed.push({ ...record }),
-	};
-	const server = (event: Record<string, unknown>) => handlers.onMessage(JSON.stringify(event));
-	voiceExtension(pi as any, deps as any);
-	return {
-		pi,
-		socket,
-		server,
-		observed,
-		written,
-		get playerStops() {
-			return playerStops;
-		},
-	};
+		createRecorder: () => ({ start() {}, stop() {}, setMuted() {} }) as any,
+		createPlayer: () => ({ write() {}, stop() {}, dispose() {} }) as any,
+	} as any);
+	return { pi, socket, server, ctx };
 }
 
 async function startVoice(env: ReturnType<typeof setup>) {
-	await env.pi.command("voice").handler("start", ctx);
+	await env.pi.command("voice").handler("start", env.ctx);
 	await flush();
 }
 
@@ -121,131 +123,86 @@ const transcript = (text: string) => ({
 	transcript: text,
 });
 
-/** PCM16 mono 24 kHz de `ms` milissegundos, em base64 como a API envia. */
-const pcm = (ms: number) => Buffer.alloc(Math.floor((24000 * 2 * ms) / 1000)).toString("base64");
-
-beforeEach(() => {
-	mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+const backgroundAgent = (callId: string, prompt: string) => ({
+	type: "response.function_call_arguments.done",
+	name: "background_agent",
+	call_id: callId,
+	arguments: JSON.stringify({ prompt }),
 });
 
-afterEach(() => {
-	mock.timers.reset();
+const messagesOf = (socket: { sent: any[] }) =>
+	socket.sent.filter((e) => e.type !== "session.update" && e.item?.role !== "developer");
+
+test("start envia instruções do Codex e o developer item de início", async () => {
+	const env = setup([
+		{ type: "message", message: { role: "user", content: "corrige o teste do parser" } },
+		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "feito" }] } },
+	]);
+	await startVoice(env);
+	const update = env.socket.sent.find((e) => e.type === "session.update");
+	assert.match(update.session.instructions, /## Identity, tone, and role/);
+	assert.match(update.session.instructions, /Diretório de trabalho: \/work\/projeto/);
+	assert.match(update.session.instructions, /\[USER\] corrige o teste do parser/);
+	const dev = env.socket.sent.find((e) => e.item?.role === "developer");
+	assert.match(dev.item.content[0].text, /^Realtime conversation started\./);
 });
 
-test("T4: transcrição vai ao pi e o realtime não responde por conta própria", async () => {
+test("background_agent ocioso inicia o turno com envelope de delegação, sem output ainda", async () => {
 	const env = setup();
 	await startVoice(env);
-
-	const update = env.socket.sent.find((m) => m.type === "session.update");
-	assert.ok(update, "session.update enviado");
-	assert.equal(update.session.audio.input.turn_detection.create_response, false, "sem resposta automática no VAD");
-	assert.equal(update.session.tools, undefined, "sem ferramenta de delegação: a voz não decide nada");
-
-	env.server(transcript("Oi, tudo bem?"));
-	await flush();
-
-	assert.equal(env.pi.sent.length, 1, "toda fala vai ao pi");
-	assert.ok(env.pi.sent[0].text.includes("Oi, tudo bem?"));
-	assert.equal(
-		env.socket.sent.filter((m) => m.type === "response.create").length,
-		0,
-		"o realtime não cria resposta própria",
-	);
+	env.server(backgroundAgent("call_1", "lista os arquivos do pacote"));
+	assert.equal(env.pi.sent.length, 1);
+	assert.match(env.pi.sent[0].text, /<realtime_delegation>\n {2}<input>lista os arquivos do pacote<\/input>/);
+	assert.equal(env.pi.sent[0].deliverAs, undefined);
+	assert.equal(messagesOf(env.socket).length, 0);
 });
 
-test("T5: fala com decisão pendente não resolve aprovação", async () => {
+test("fim do run devolve [BACKEND], function_call_output e response.create nessa ordem", async () => {
 	const env = setup();
 	await startVoice(env);
-
-	await env.pi.emit("ui_prompt_start", { kind: "permission", title: "Apagar pasta?" }, ctx);
-	env.server(transcript("Sim"));
-	await flush();
-
-	assert.equal(env.pi.sent.length, 0, '"sim" falado não é enviado como resposta à decisão');
-	assert.equal(env.pi.aborts, 0);
-	const announce = env.socket.sent.find((m) => m.type === "response.create");
-	assert.ok(announce, "a voz avisa que há decisão pendente");
-	assert.ok(/decisão/i.test(JSON.stringify(announce)));
-
-	await env.pi.emit("ui_prompt_end", { kind: "permission", title: "Apagar pasta?" }, ctx);
-	env.server(transcript("Explica o erro"));
-	await flush();
-	assert.equal(env.pi.sent.length, 1, "após a decisão, fala volta a ir ao pi");
+	env.server(backgroundAgent("call_1", "faz X"));
+	await env.pi.emit("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "X feito." }] }] }, env.ctx);
+	const [backend, output, create] = messagesOf(env.socket);
+	assert.equal(backend.item.content[0].text, "[BACKEND] X feito.");
+	assert.deepEqual(output, {
+		type: "conversation.item.create",
+		item: { type: "function_call_output", call_id: "call_1", output: HANDOFF_COMPLETE_ACK },
+	});
+	assert.deepEqual(create, { type: "response.create" });
 });
 
-test("T2 integrado: fala durante execução para o áudio, envia steer e não cancela o pi", async () => {
+test("background_agent com agente ocupado vira steer e recebe o ack da própria chamada", async () => {
 	const env = setup();
 	await startVoice(env);
-
-	env.server(transcript("Explica o cache."));
-	await flush();
-	await env.pi.emit("agent_start", {}, ctx);
-	await env.pi.emit(
-		"agent_end",
-		{ messages: [{ role: "assistant", content: [{ type: "text", text: "Cache é uma memória intermediária." }] }] },
-		ctx,
-	);
-	await flush();
-	env.server({ type: "response.output_audio.delta", delta: pcm(3000) });
-	await flush();
-	assert.equal(env.observed.at(-1)?.state, "reproduzindo", "precondição: resposta sendo falada");
-
-	await env.pi.emit("agent_start", {}, ctx);
-	env.server({ type: "input_audio_buffer.speech_started" });
-	env.server(transcript("Foca só no arquivo de testes."));
-	await flush();
-
-	assert.ok(env.playerStops >= 1, "começar a falar corta o áudio local");
-	assert.equal(env.pi.aborts, 0, "fala não cancela a execução");
-	const last = env.pi.sent.at(-1)!;
-	assert.equal(last.deliverAs, "steer", "fala durante execução entra como steer");
-	assert.ok(last.text.includes("Foca só no arquivo de testes."));
-	assert.equal(env.observed.at(-1)?.state, "interrompida");
+	env.server(backgroundAgent("call_1", "faz X"));
+	env.ctx.idle = false;
+	env.server(backgroundAgent("call_2", "e também Y"));
+	assert.equal(env.pi.sent[1].deliverAs, "steer");
+	const output = messagesOf(env.socket).find((e) => e.type === "conversation.item.create" && e.item.call_id === "call_2");
+	assert.equal(output.item.output, STEER_ACK);
+	// Um único fim de run completa a chamada original, não o steer.
+	await env.pi.emit("agent_end", { messages: [] }, env.ctx);
+	const completions = messagesOf(env.socket).filter((e) => e.item?.output === HANDOFF_COMPLETE_ACK);
+	assert.deepEqual(completions.map((e) => e.item.call_id), ["call_1"]);
 });
 
-test("término estimado pelo timer real: áudio tocado até o fim vira concluida_estimada", async () => {
+test("remain_silent devolve saída vazia e não pede resposta", async () => {
 	const env = setup();
 	await startVoice(env);
-
-	await env.pi.emit("agent_start", {}, ctx);
-	await env.pi.emit("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "Pronto." }] }] }, ctx);
-	await flush();
-	env.server({ type: "response.output_audio.delta", delta: pcm(1000) });
-	env.server({ type: "response.done" });
-	await flush();
-	assert.equal(env.observed.at(-1)?.state, "reproduzindo");
-
-	mock.timers.tick(2000);
-	await flush();
-	assert.equal(env.observed.at(-1)?.state, "concluida_estimada");
+	env.server({ type: "response.function_call_arguments.done", name: "remain_silent", call_id: "call_s", arguments: "{}" });
+	const [output] = messagesOf(env.socket);
+	assert.deepEqual(output.item, { type: "function_call_output", call_id: "call_s", output: "" });
+	assert.equal(messagesOf(env.socket).some((e) => e.type === "response.create"), false);
 });
 
-test("timer antigo não marca reprodução interrompida como concluída", async () => {
+test("fala do usuário vai ao histórico do pi sem disparar turno", async () => {
 	const env = setup();
 	await startVoice(env);
-
-	// Primeira fala: ~2 s de áudio, término agendado pelo timer.
-	await env.pi.emit("agent_start", {}, ctx);
-	await env.pi.emit("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "Primeira." }] }] }, ctx);
-	await flush();
-	env.server({ type: "response.output_audio.delta", delta: pcm(2000) });
-	env.server({ type: "response.done" });
-	await flush();
-	const firstId = env.observed.at(-1)!.id;
-
-	// Interrompe antes do fim: o timer da primeira continua agendado.
-	mock.timers.tick(500);
-	env.server({ type: "input_audio_buffer.speech_started" });
-	await flush();
-
-	// Segunda fala começa; o timer antigo dispara depois.
-	await env.pi.emit("agent_start", {}, ctx);
-	await env.pi.emit("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "Segunda." }] }] }, ctx);
-	await flush();
-	mock.timers.tick(5000);
-	await flush();
-
-	const firstFinal = env.observed.filter((r) => r.id === firstId).at(-1)!;
-	assert.equal(firstFinal.state, "interrompida", "timer antigo não reescreve a interrupção");
-	assert.ok(firstFinal.fraction !== undefined && firstFinal.fraction > 0 && firstFinal.fraction < 1);
+	env.server(transcript("explica o módulo de áudio"));
+	assert.equal(env.pi.sent.length, 0, "nenhum turno iniciado pela fala");
+	assert.equal(env.pi.custom.length, 1);
+	assert.equal(env.pi.custom[0].message.content, "[USER] explica o módulo de áudio");
+	assert.equal(env.pi.custom[0].message.display, false);
+	assert.equal(env.pi.custom[0].options, undefined, "sem triggerTurn");
+	assert.deepEqual(env.pi.entries.map((e) => e.data.text), ["explica o módulo de áudio"]);
 });

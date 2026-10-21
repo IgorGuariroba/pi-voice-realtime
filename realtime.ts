@@ -1,49 +1,48 @@
 /**
- * Sessão realtime (`/v1/realtime`) — equivalente de
- * `codex-rs/core/src/realtime_conversation.rs` + `codex-api/realtime_websocket`.
+ * Sessão realtime V2 (`/v1/realtime`) — equivalente de
+ * `codex-rs/core/src/realtime_conversation.rs` (RealtimeWsVersion::V2) e de
+ * `codex-api/src/endpoint/realtime_websocket/methods_v2.rs`.
  *
- * Divergências conscientes do Codex:
- * 1. Codex usa `intent=quicksilver` com auth ChatGPT; aqui é a API pública com
- *    API key (único caminho existente fora do produto Codex).
- * 2. Codex negocia WebRTC (SDP/ICE); aqui é WebSocket com PCM16. Mesmo modelo,
- *    mesmas vozes, mesmo VAD de servidor.
- * 3. O handoff é a tool `delegate_to_pi` (a API pública não expõe o handoff
- *    interno que o Codex usa entre a sessão de voz e o agente).
- *
- * Dialeto do payload é explícito (`PI_VOICE_DIALECT=ga|beta`), sem fallback
- * automático: reenviar em outro formato esconderia um payload errado.
+ * Divergências conscientes do Codex (ADR 0002):
+ * 1. Auth: API key (`OPENAI_API_KEY`) em vez de ChatGPT + `intent=quicksilver`.
+ * 2. Transporte: WebSocket PCM16 em vez de WebRTC (Node não tem o helper nativo).
+ * Todo o resto do payload e do ciclo de handoff segue o Codex.
  */
 
-import { API_BASE, type VoiceSettings } from "./config.ts";
-import { backendHeader } from "./delegation.ts";
+import type { VoiceSettings } from "./config.ts";
 import { openRealtimeSocket, type OpenSocketOptions, type TransportInfo, type VoiceSocket } from "./socket.ts";
 
 export type VoiceEvent =
 	| { kind: "ready" }
-	| { kind: "audio"; pcm: Buffer }
+	| { kind: "audio"; pcm: Buffer; itemId?: string }
 	| { kind: "user_transcript"; text: string }
 	| { kind: "assistant_transcript"; text: string; final: boolean }
 	| { kind: "speech_started" }
 	| { kind: "speech_stopped" }
-	| { kind: "delegate"; callId: string; input: string }
+	| { kind: "background_agent"; callId: string; prompt: string }
+	| { kind: "remain_silent"; callId: string }
 	| { kind: "response_done" }
 	| { kind: "error"; message: string; dialectHint: boolean }
 	| { kind: "other"; type: string };
 
-/** Nome da função exposta ao modelo de voz, no lugar do handoff nativo do Codex. */
-export const DELEGATE_TOOL = "delegate_to_pi";
+/** Ferramentas da V2 (methods_v2.rs). Nome e descrição idênticos ao Codex. */
+export const BACKGROUND_AGENT_TOOL = "background_agent";
+export const REMAIN_SILENT_TOOL = "remain_silent";
 
-export type VoiceDialect = "ga" | "beta";
+const BACKGROUND_AGENT_DESCRIPTION =
+	"Send a user request to the background agent. Use this as the default action. Do not rephrase the user's ask or rewrite it in your own words; pass along the user's own words. If the background agent is idle, this starts a new task and returns the final result to the user. If the background agent is already working on a task, this sends the request as guidance to steer that previous task. If the user asks to do something next, later, after this, or once current work finishes, call this tool so the work is actually queued instead of merely promising to do it later.";
+const REMAIN_SILENT_DESCRIPTION =
+	"Call this when the best response is to say nothing. Use it instead of speaking after hidden system/control messages, after background agent updates in silent modes, or whenever acknowledging aloud would be distracting. This tool has no user-visible effect.";
 
-export function resolveDialect(env: NodeJS.ProcessEnv = process.env): VoiceDialect {
-	const raw = (env.PI_VOICE_DIALECT ?? "").trim().toLowerCase();
-	return raw === "beta" ? "beta" : "ga";
-}
+/** Transcrição de entrada usada pelo Codex na V2. */
+export const INPUT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
+
+/** Taxa do PCM16 mono (24 kHz) usada pelo Codex. */
+const PCM_RATE = 24_000;
 
 /**
- * Normaliza um evento cru da API. Aceita os nomes GA (`response.output_audio.delta`)
- * e os beta (`response.audio.delta`) porque o *parser* pode ser tolerante mesmo
- * que o *payload* seja enviado em um dialeto só.
+ * Normaliza um evento cru da API GA (`response.output_audio.*`).
+ * Nomes beta não são mais enviados: a V2 do Codex usa só o formato GA.
  */
 export function parseRealtimeEvent(raw: unknown): VoiceEvent | null {
 	if (typeof raw !== "object" || raw === null) return null;
@@ -54,24 +53,22 @@ export function parseRealtimeEvent(raw: unknown): VoiceEvent | null {
 	switch (type) {
 		case "session.created":
 		case "session.updated":
-		case "transcription_session.created":
-		case "transcription_session.updated":
-			// Informativo. Quem decide "pronto" é RealtimeSession, pelo tipo `*.updated`.
 			return { kind: "ready" };
 
 		case "response.output_audio.delta":
-		case "response.audio.delta":
-			return { kind: "audio", pcm: Buffer.from(String(event.delta ?? ""), "base64") };
+			return {
+				kind: "audio",
+				pcm: Buffer.from(String(event.delta ?? ""), "base64"),
+				itemId: typeof event.item_id === "string" ? event.item_id : undefined,
+			};
 
 		case "conversation.item.input_audio_transcription.completed":
 			return { kind: "user_transcript", text: String(event.transcript ?? "").trim() };
 
 		case "response.output_audio_transcript.delta":
-		case "response.audio_transcript.delta":
 			return { kind: "assistant_transcript", text: String(event.delta ?? ""), final: false };
 
 		case "response.output_audio_transcript.done":
-		case "response.audio_transcript.done":
 			return { kind: "assistant_transcript", text: String(event.transcript ?? ""), final: true };
 
 		case "input_audio_buffer.speech_started":
@@ -86,25 +83,24 @@ export function parseRealtimeEvent(raw: unknown): VoiceEvent | null {
 		case "error": {
 			const message = String(event.error?.message ?? event.message ?? "erro realtime");
 			// Pistas de payload errado são reportadas, não corrigidas em silêncio.
-			const dialectHint =
-				/unknown (parameter|field)|not supported|invalid (value|type)|audio.*(format|config)/i.test(message);
+			const dialectHint = /unknown (parameter|field)|not supported|invalid (value|type)|audio.*(format|config)/i.test(message);
 			return { kind: "error", message, dialectHint };
 		}
 
 		case "response.function_call_arguments.done": {
 			const name = String(event.name ?? "");
-			if (name !== DELEGATE_TOOL) return { kind: "other", type };
-			let input = "";
+			const callId = String(event.call_id ?? "");
+			if (name === REMAIN_SILENT_TOOL) return { kind: "remain_silent", callId };
+			if (name !== BACKGROUND_AGENT_TOOL) return { kind: "other", type };
+			let prompt = "";
 			try {
 				const args = JSON.parse(String(event.arguments ?? "{}"));
-				input = String(args.input ?? args.request ?? "").trim();
+				prompt = String(args.prompt ?? "").trim();
 			} catch {
-				return { kind: "error", message: "argumentos inválidos na delegação de voz", dialectHint: false };
+				return { kind: "error", message: "argumentos inválidos em background_agent", dialectHint: false };
 			}
-			if (!input) {
-				return { kind: "error", message: "delegação de voz sem pedido", dialectHint: false };
-			}
-			return { kind: "delegate", callId: String(event.call_id ?? ""), input };
+			if (!prompt) return { kind: "error", message: "background_agent sem pedido", dialectHint: false };
+			return { kind: "background_agent", callId, prompt };
 		}
 
 		default:
@@ -112,116 +108,83 @@ export function parseRealtimeEvent(raw: unknown): VoiceEvent | null {
 	}
 }
 
-/** Prompt de voz: espírito do `BACKEND_PROMPT` do Codex, em pt-BR e curto. */
-export function voiceInstructions(userName?: string): string {
-	const name = userName ? ` O usuário se chama ${userName}.` : "";
-	return `## Identidade, tom e papel
-Você é a voz do Pi, um agente de programação que roda no terminal do usuário.${name}
-Você fala português do Brasil, com frases curtas, tom direto e sem formalidade.
-Você nunca lê código, caminhos de arquivo longos ou saídas de terminal em voz alta.
-Você não executa trabalho de código você mesmo: você delega.
-
-## Como você trabalha
-- Pedido de código, análise, arquivo, comando ou investigação: chame \`${DELEGATE_TOOL}\`
-  com o pedido reescrito de forma completa e autocontida (o agente de código não
-  ouve a conversa), e diga em uma frase curta que já está cuidando disso.
-- Pergunta simples de conversa ou sobre o que está acontecendo: responda direto.
-- Enquanto o agente trabalha você recebe mensagens prefixadas com [BACKEND].
-  Nunca invente progresso. Se o usuário falar nesse meio tempo, você pode
-  complementar ou corrigir o pedido chamando \`${DELEGATE_TOOL}\` de novo com o
-  pedido revisado.
-- Quando chegar \`[BACKEND] Agent Final Message\`, resuma o resultado em 1 a 3
-  frases faladas. Nunca leia diff, código ou lista de arquivos literalmente.
-- Quando chegar \`[BACKEND] Agent needs a decision\`, avise em uma frase qual é a
-  decisão pendente e espere a resposta do usuário.
-
-## Limites
-- Uma ideia por frase. Sem listas, sem markdown, sem emoji.
-- Se não entendeu, peça para repetir em vez de adivinhar.`;
+/** Instruções de sessão = backend_prompt (+ contexto de inicialização), como no Codex. */
+export function buildInstructions(backendPrompt: string, startupContext = ""): string {
+	return startupContext.trim() ? `${backendPrompt.trim()}\n\n${startupContext.trim()}` : backendPrompt.trim();
 }
 
-const TOOL_DEFINITION = {
-	type: "function",
-	name: DELEGATE_TOOL,
-	description:
-		"Delega um pedido de código, análise ou investigação ao agente Pi no terminal. Use sempre que o pedido exigir ler arquivos, rodar comandos ou alterar código.",
-	parameters: {
-		type: "object",
-		properties: {
-			input: {
-				type: "string",
-				description:
-					"Pedido completo e autocontido, com todo o contexto necessário. O agente não ouve a conversa.",
-			},
-		},
-		required: ["input"],
-	},
-} as const;
-
-const TURN_DETECTION = {
-	type: "server_vad",
-	threshold: 0.5,
-	prefix_padding_ms: 300,
-	silence_duration_ms: 500,
-	create_response: true,
-	interrupt_response: true,
-} as const;
-
 /**
- * Payload de `session.update`, puro e testável.
- * GA (2025-08+): `audio.input.format` / `audio.output.voice`.
- * Beta (legado): `input_audio_format` / `output_audio_format` / `voice`.
+ * Payload de `session.update` da V2 (methods_v2.rs, modo conversacional).
+ * `model` vai na URL, como no Codex.
  */
 export function buildSessionUpdate(
-	dialect: VoiceDialect,
 	settings: VoiceSettings,
-	userName?: string,
+	instructions: string,
 ): Record<string, unknown> {
-	const instructions = voiceInstructions(userName);
-	const tools = [TOOL_DEFINITION];
-
-	if (dialect === "beta") {
-		return {
-			type: "session.update",
-			session: {
-				model: settings.model,
-				instructions,
-				voice: settings.voice,
-				input_audio_format: "pcm16",
-				output_audio_format: "pcm16",
-				input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
-				turn_detection: TURN_DETECTION,
-				tools,
-				tool_choice: "auto",
-			},
-		};
-	}
-
 	return {
 		type: "session.update",
 		session: {
 			type: "realtime",
-			model: settings.model,
 			instructions,
+			output_modalities: ["audio"],
 			audio: {
 				input: {
-					format: { type: "audio/pcm", rate: 24_000 },
-					transcription: { model: "gpt-4o-mini-transcribe" },
-					turn_detection: TURN_DETECTION,
+					format: { type: "audio/pcm", rate: PCM_RATE },
+					noise_reduction: { type: "near_field" },
+					transcription: { model: INPUT_TRANSCRIPTION_MODEL },
+					turn_detection: {
+						type: "server_vad",
+						interrupt_response: true,
+						create_response: true,
+						silence_duration_ms: 500,
+					},
 				},
-				output: { format: { type: "audio/pcm", rate: 24_000 }, voice: settings.voice },
+				output: { format: { type: "audio/pcm", rate: PCM_RATE }, voice: settings.voice },
 			},
-			tools,
+			tools: [
+				{
+					type: "function",
+					name: BACKGROUND_AGENT_TOOL,
+					description: BACKGROUND_AGENT_DESCRIPTION,
+					parameters: {
+						type: "object",
+						properties: {
+							prompt: {
+								type: "string",
+								description: "The user request to delegate to the background agent.",
+							},
+						},
+						required: ["prompt"],
+						additionalProperties: false,
+					},
+				},
+				{
+					type: "function",
+					name: REMAIN_SILENT_TOOL,
+					description: REMAIN_SILENT_DESCRIPTION,
+					parameters: { type: "object", properties: {}, additionalProperties: false },
+				},
+			],
 			tool_choice: "auto",
 		},
+	};
+}
+
+/** Item de desenvolvedor injetado ao iniciar (realtime_start.md). */
+export function developerItem(text: string): Record<string, unknown> {
+	return {
+		type: "conversation.item.create",
+		item: { type: "message", role: "developer", content: [{ type: "input_text", text }] },
 	};
 }
 
 export interface RealtimeSessionOptions {
 	apiKey: string;
 	settings: VoiceSettings;
-	userName?: string;
-	dialect?: VoiceDialect;
+	/** Instruções completas (backend prompt + contexto de inicialização). */
+	instructions: string;
+	/** Item de desenvolvedor enviado após `session.updated` (início da sessão). */
+	startItem?: string;
 	/** Abertura do socket. Padrão: `openRealtimeSocket`; injetável para teste. */
 	openSocket?: (options: OpenSocketOptions) => Promise<VoiceSocket>;
 	onEvent: (event: VoiceEvent) => void;
@@ -234,15 +197,11 @@ export const CONNECT_TIMEOUT_MS = 15_000;
 
 /**
  * Ciclo de vida:
- *   idle → connecting (socket criado, ainda não aberto)
- *        → configuring (aberto; session.update enviado, aguardando session.updated)
- *        → ready (só aqui há envio de áudio)
- *        → closed (terminal)
+ *   idle → connecting → configuring (session.update enviado, aguarda session.updated)
+ *        → ready → closed (terminal)
  * Nada é enviado fora de `configuring`/`ready`, e `send` nunca lança para fora.
  */
 type SessionState = "idle" | "connecting" | "configuring" | "ready" | "closed";
-
-const NO_ACTIVE_RESPONSE = /no active response/i;
 
 export class RealtimeSession {
 	private socket: VoiceSocket | undefined;
@@ -250,20 +209,18 @@ export class RealtimeSession {
 	private setup: { resolve: () => void; reject: (error: Error) => void } | undefined;
 	/** Há resposta do modelo em andamento (response.created … response.done). */
 	private responseActive = false;
+	/** Um `response.create` foi pedido enquanto havia resposta ativa (fila de 1, como o Codex). */
+	private createPending = false;
+	/** Áudio de saída da resposta corrente, para truncar no barge-in. */
+	private outputAudio: { itemId: string; audioEndMs: number } | undefined;
 	private readonly options: RealtimeSessionOptions;
-	private readonly dialect: VoiceDialect;
 
 	constructor(options: RealtimeSessionOptions) {
 		this.options = options;
-		this.dialect = options.dialect ?? resolveDialect();
 	}
 
 	get transport(): TransportInfo | undefined {
 		return this.socket?.transport;
-	}
-
-	get dialectInUse(): VoiceDialect {
-		return this.dialect;
 	}
 
 	/** Resolve só quando `session.updated` chega. Rejeita em erro, fechamento ou timeout. */
@@ -273,12 +230,8 @@ export class RealtimeSession {
 		const ready = new Promise<void>((resolve, reject) => {
 			this.setup = { resolve, reject };
 		});
-		// Falha pode ocorrer antes de alguém aguardar: evita unhandled rejection.
 		ready.catch(() => {});
-		const timer = setTimeout(
-			() => this.failSetup(new Error("tempo esgotado ao conectar na voz")),
-			CONNECT_TIMEOUT_MS,
-		);
+		const timer = setTimeout(() => this.failSetup(new Error("tempo esgotado ao conectar na voz")), CONNECT_TIMEOUT_MS);
 		void this.open().catch((error: Error) => this.failSetup(error));
 		return ready.finally(() => clearTimeout(timer));
 	}
@@ -288,12 +241,12 @@ export class RealtimeSession {
 		const socket = await openSocket({
 			apiKey: this.options.apiKey,
 			model: this.options.settings.model,
-			dialect: this.dialect,
+			dialect: "ga",
 			handlers: {
 				onOpen: () => {
 					if (this.state !== "connecting") return;
 					this.state = "configuring";
-					this.send(buildSessionUpdate(this.dialect, this.options.settings, this.options.userName));
+					this.send(buildSessionUpdate(this.options.settings, this.options.instructions));
 				},
 				onMessage: (data) => this.handleMessage(data),
 				onClose: (code, reason) => {
@@ -316,7 +269,6 @@ export class RealtimeSession {
 			},
 		});
 		this.socket = socket;
-		// Chegou depois de cancelado (timeout, /voice stop): não deixa socket aberto.
 		if (this.state === "closed") this.closeSocket();
 	}
 
@@ -328,15 +280,25 @@ export class RealtimeSession {
 			return;
 		}
 		const type = (parsed as { type?: unknown } | null)?.type;
+
 		if (type === "response.created") this.responseActive = true;
-		if (type === "response.done") this.responseActive = false;
-		// Barge-in sem resposta ativa: o servidor responde com erro. Não é falha do usuário.
-		if (type === "error" && NO_ACTIVE_RESPONSE.test(JSON.stringify(parsed))) return;
-		if (this.state === "configuring" && (type === "session.updated" || type === "transcription_session.updated")) {
+		if (type === "response.done") this.onResponseFinished();
+
+		if (this.state === "configuring" && type === "session.updated") {
 			this.state = "ready";
+			if (this.options.startItem) this.send(developerItem(this.options.startItem));
 			this.setup?.resolve();
 		}
+
+		// Barge-in: `interrupt_response` cancela no servidor; aqui só truncamos o áudio já emitido.
+		if (type === "input_audio_buffer.speech_started") this.truncateOutputAudio();
+
 		const event = parseRealtimeEvent(parsed);
+		if (event?.kind === "audio" && event.itemId) {
+			const ms = (event.pcm.length / 2 / PCM_RATE) * 1000;
+			if (this.outputAudio?.itemId === event.itemId) this.outputAudio.audioEndMs += ms;
+			else this.outputAudio = { itemId: event.itemId, audioEndMs: ms };
+		}
 		if (this.state === "configuring" && event?.kind === "error") {
 			this.failSetup(new Error(event.message));
 			return;
@@ -344,10 +306,28 @@ export class RealtimeSession {
 		if (event) this.options.onEvent(event);
 	}
 
-	/**
-	 * Envia um evento. Retorna false sem lançar quando não há envio possível.
-	 * Falha de transporte encerra a sessão em vez de propagar a exceção.
-	 */
+	private onResponseFinished(): void {
+		this.responseActive = false;
+		this.outputAudio = undefined;
+		if (this.createPending) {
+			this.createPending = false;
+			this.createResponse();
+		}
+	}
+
+	private truncateOutputAudio(): void {
+		const audio = this.outputAudio;
+		this.outputAudio = undefined;
+		if (!audio) return;
+		this.send({
+			type: "conversation.item.truncate",
+			item_id: audio.itemId,
+			content_index: 0,
+			audio_end_ms: Math.floor(audio.audioEndMs),
+		});
+	}
+
+	/** Envia um evento. Retorna false sem lançar quando não há envio possível. */
 	private send(event: Record<string, unknown>): boolean {
 		const socket = this.socket;
 		if (!socket || !socket.isOpen()) {
@@ -363,7 +343,6 @@ export class RealtimeSession {
 		}
 	}
 
-	/** Encerramento por falha. Só age nos estados ativos e ocorre uma vez. */
 	private fatal(reason: string): void {
 		if (this.state === "connecting" || this.state === "configuring") {
 			this.failSetup(new Error(reason));
@@ -392,38 +371,57 @@ export class RealtimeSession {
 		}
 	}
 
-	/** Envia áudio só quando pronta. Antes disso o microfone nem deveria estar ligado. */
+	/** Envia áudio só quando pronta. */
 	appendAudio(frame: Buffer): void {
 		if (this.state !== "ready") return;
 		this.send({ type: "input_audio_buffer.append", audio: frame.toString("base64") });
 	}
 
-	/** Barge-in: cancela só se há resposta em andamento (senão o servidor responde com erro). */
-	cancelResponse(): void {
-		if (!this.responseActive) return;
-		this.send({ type: "response.cancel" });
+	/**
+	 * Pede uma resposta falada. Se já há uma em andamento, fica pendente e é
+	 * enviada ao `response.done` (`RealtimeResponseCreateQueue` do Codex).
+	 */
+	createResponse(): void {
+		if (this.state !== "ready") return;
+		if (this.responseActive) {
+			this.createPending = true;
+			return;
+		}
+		this.responseActive = true;
+		this.send({ type: "response.create" });
 	}
 
-	createResponse(instructions?: string): void {
-		this.send({
-			type: "response.create",
-			response: instructions ? { instructions } : undefined,
-		});
-	}
-
-	/** Injeta texto no fio da conversa: `[USER] ` ou `[BACKEND] `, como o Codex. */
-	conversationText(role: "user" | "assistant", text: string): void {
+	/** Resultado de uma chamada de função (`background_agent`, `remain_silent`). */
+	functionCallOutput(callId: string, output: string): void {
+		if (this.state !== "ready") return;
 		this.send({
 			type: "conversation.item.create",
-			item: { type: "message", role, content: [{ type: "input_text", text }] },
+			item: { type: "function_call_output", call_id: callId, output },
 		});
 	}
 
-	/** Resultado do handoff: prefixo `[BACKEND]`, igual ao Codex. */
-	backendResult(text: string, kind: "final" | "decision"): string {
-		const header = backendHeader(kind);
-		this.conversationText("user", header + text);
-		return header;
+	/** Texto digitado do usuário (mesmo papel que a transcrição de voz). Usado em testes E2E. */
+	userText(text: string): void {
+		if (this.state !== "ready") return;
+		this.send({
+			type: "conversation.item.create",
+			item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+		});
+	}
+
+	/** Mensagem de desenvolvedor (início/fim da conversa, `realtime_start.md`/`realtime_end.md`). */
+	developerText(text: string): void {
+		if (this.state !== "ready") return;
+		this.send(developerItem(text));
+	}
+
+	/** Item `[BACKEND] ` do Codex: progresso ou resultado do agente, lido pelo modelo como usuário. */
+	backendItem(text: string): void {
+		if (this.state !== "ready") return;
+		this.send({
+			type: "conversation.item.create",
+			item: { type: "message", role: "user", content: [{ type: "input_text", text: `[BACKEND] ${text}` }] },
+		});
 	}
 
 	/** Encerramento pedido pelo usuário: não dispara `onClose`. */

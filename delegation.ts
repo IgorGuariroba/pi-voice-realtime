@@ -21,9 +21,14 @@ function unescapeXml(text: string): string {
 	return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 }
 
-/** Monta o turno delegado a partir da fala do usuário. */
-export function wrapDelegation(input: string, transcriptDelta?: string): string {
-	const lines = [OPEN_TAG, `  <input>${escapeXml(input.trim())}</input>`];
+/** Origem do turno delegado (`RealtimeDelegationSource` do Codex). */
+export type DelegationSource = "handoff" | "transcript_tail_flush";
+
+/** Monta o turno delegado a partir da fala do usuário (`context/realtime_delegation.rs`). */
+export function wrapDelegation(input: string, transcriptDelta?: string, source: DelegationSource = "handoff"): string {
+	const lines = [OPEN_TAG];
+	if (source === "transcript_tail_flush") lines.push("  <source>transcript_tail_flush</source>");
+	lines.push(`  <input>${escapeXml(input.trim())}</input>`);
 	if (transcriptDelta?.trim()) {
 		lines.push(`  <transcript_delta>${escapeXml(transcriptDelta.trim())}</transcript_delta>`);
 	}
@@ -71,7 +76,8 @@ export function finalAnswerText(
 	return undefined;
 }
 
-/** Prefixo que o Codex usa ao devolver o resultado para a sessão de voz. */
-export function backendHeader(kind: "final" | "decision"): string {
-	return kind === "final" ? "[BACKEND] Agent Final Message:\n\n" : "[BACKEND] Agent needs a decision:\n\n";
-}
+/** Retorno de `background_agent` quando a tarefa termina (V2, `REALTIME_V2_HANDOFF_COMPLETE_ACKNOWLEDGEMENT`). */
+export const HANDOFF_COMPLETE_ACK = "Background agent finished. Use the preceding [BACKEND] messages as the result.";
+
+/** Retorno de `background_agent` quando o pedido vira steer de tarefa ativa (`REALTIME_V2_STEER_ACKNOWLEDGEMENT`). */
+export const STEER_ACK = "This was sent to steer the previous background agent task.";

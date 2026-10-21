@@ -3,11 +3,11 @@
  *
  * Fluxo (igual ao Codex):
  *   /voice  → abre sessão realtime full-duplex (mic aberto, VAD do servidor).
- *   Você fala → o modelo de voz responde falando e, quando o pedido exige
- *   trabalho de código, delega para o agente Pi via `delegate_to_pi`.
- *   O pedido vira um turno normal: `<realtime_delegation><input>…</input></realtime_delegation>`.
- *   Ao terminar, a resposta final volta para a sessão realtime como
- *   `[BACKEND] Agent Final Message: …` e o modelo a resume em voz alta.
+ *   Você fala → o modelo de voz conversa e, para qualquer trabalho, chama
+ *   `background_agent` (ADR 0002). O pedido vira um turno normal do pi:
+ *   `<realtime_delegation><input>…</input></realtime_delegation>`.
+ *   Progresso e resultado voltam como `[BACKEND] …`, seguidos de
+ *   `function_call_output` e resposta falada.
  *
  * Comandos: /voice [start|stop|mute|unmute|settings|status]
  * Atalho:   f9 — muta/desmuta o microfone.
@@ -31,15 +31,38 @@ import {
 	type VoiceName,
 	type VoiceSettings,
 } from "./config.ts";
-import { finalAnswerText, unwrapDelegation, wrapDelegation } from "./delegation.ts";
+import {
+	HANDOFF_COMPLETE_ACK,
+	STEER_ACK,
+	finalAnswerText,
+	unwrapDelegation,
+	wrapDelegation,
+} from "./delegation.ts";
+import { END_INSTRUCTIONS, START_INSTRUCTIONS, backendPrompt } from "./prompts.ts";
+import { buildStartupContext } from "./startup-context.ts";
 import { createVoiceWidget, statusText, type VoiceViewState } from "./footer.ts";
-import { RealtimeSession, resolveDialect, type VoiceEvent } from "./realtime.ts";
+import { RealtimeSession, buildInstructions, type RealtimeSessionOptions, type VoiceEvent } from "./realtime.ts";
 
 const WIDGET_KEY = "voice";
 const STATUS_KEY = "voice";
 const TRANSCRIPT_ENTRY = "voice-transcript";
 
-export default function (pi: ExtensionAPI) {
+/** Dependências externas (socket, AEC, microfone, player). Injetáveis para teste. */
+export interface VoiceDeps {
+	openSocket?: RealtimeSessionOptions["openSocket"];
+	openEcho: () => Promise<EchoAudio>;
+	createPlayer: (...args: ConstructorParameters<typeof Player>) => Player;
+	createRecorder: (...args: ConstructorParameters<typeof Recorder>) => Recorder;
+}
+
+const DEFAULT_DEPS: VoiceDeps = {
+	openEcho: () => openEchoAudio(),
+	createPlayer: (backend, onError) => new Player(backend, onError),
+	createRecorder: (handlers) => new Recorder(handlers),
+};
+
+export default function (pi: ExtensionAPI, overrides: Partial<VoiceDeps> = {}) {
+	const deps: VoiceDeps = { ...DEFAULT_DEPS, ...overrides };
 	let settings: VoiceSettings = loadSettings();
 	let session: RealtimeSession | undefined;
 	let recorder: Recorder | undefined;
@@ -48,7 +71,10 @@ export default function (pi: ExtensionAPI) {
 	const echoCleanup = new EchoCleanup();
 	let muted = false;
 	let speaking = false;
-	let pendingDelegations = 0;
+	/** Chamada `background_agent` em andamento; o resultado é devolvido quando o pi termina. */
+	let activeCall: string | undefined;
+	/** Há um run do pi em andamento (agent_start → agent_end). */
+	let agentRunning = false;
 	let view: VoiceViewState = { phase: "listening", speaking: false };
 	/** Pico do microfone desde a última amostra da onda. */
 	// Mesma régra do áudio do agente: RMS médio por janela de 60 ms (não pico de frame).
@@ -110,7 +136,7 @@ export default function (pi: ExtensionAPI) {
 			outSchedule = [];
 			view = {
 				...view,
-				phase: pendingDelegations > 0 ? "working" : muted ? "muted" : "listening",
+				phase: activeCall ? "working" : muted ? "muted" : "listening",
 				speaking: false,
 			};
 			refresh();
@@ -122,11 +148,21 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus(STATUS_KEY, statusText(view, ctx.ui.theme));
 	};
 
-	function recordTranscript(ctx: ExtensionContext, role: "user" | "agent", text: string) {
+	/**
+	 * Fala consolidada entra no histórico do pi sem disparar turno (`sendMessage`
+	 * sem `triggerTurn`), como o Codex grava TranscriptSegment no contexto do modelo.
+	 * A exibição usa a entrada persistida ao lado.
+	 */
+	function recordTranscript(role: "user" | "agent", text: string) {
 		if (!text.trim()) return;
 		pi.appendEntry(TRANSCRIPT_ENTRY, { role, text });
 		caption(text);
-		void ctx;
+		if (role === "user") {
+			pi.sendMessage(
+				{ customType: "voice-speech", content: `[USER] ${text.trim()}`, display: false },
+				agentRunning ? { deliverAs: "nextTurn" } : undefined,
+			);
+		}
 	}
 
 	function teardown(reason: string | undefined, ctx: ExtensionContext) {
@@ -141,7 +177,7 @@ export default function (pi: ExtensionAPI) {
 		if (oldEcho) echoCleanup.add(oldEcho);
 		void echoCleanup.flush().catch(() => ctx.ui.notify("falha ao liberar módulo AEC; limpeza será tentada novamente", "warning"));
 		speaking = false;
-		pendingDelegations = 0;
+		activeCall = undefined;
 		if (speakingTimer) clearTimeout(speakingTimer);
 		speakingTimer = undefined;
 		outSchedule = [];
@@ -198,11 +234,16 @@ export default function (pi: ExtensionAPI) {
 		// Estado "connecting" até a sessão estar configurada; microfone só depois.
 		setStatus(ctx);
 
+		const instructions = buildInstructions(
+			backendPrompt(process.env.USER || process.env.USERNAME),
+			buildStartupContext(ctx.sessionManager.getBranch(), ctx.cwd),
+		);
 		const current = new RealtimeSession({
 			apiKey,
 			settings,
-			userName: process.env.USER || process.env.USERNAME,
-			dialect: resolveDialect(),
+			instructions,
+			startItem: START_INSTRUCTIONS,
+			openSocket: deps.openSocket,
 			onEvent,
 			onClose: (reason) => {
 				if (session === current) teardown(reason, ctx);
@@ -226,17 +267,17 @@ export default function (pi: ExtensionAPI) {
 			if (settings.inputDevice || settings.outputDevice) {
 				throw new Error("AEC usa os dispositivos padrão PulseAudio/PipeWire; remova inputDevice/outputDevice de voice.json");
 			}
-			const routes = await openEchoAudio();
+			const routes = await deps.openEcho();
 			if (session !== current) {
 				echoCleanup.add(routes);
 				await echoCleanup.flush().catch(() => ctx.ui.notify("falha ao liberar AEC de sessão cancelada", "warning"));
 				return;
 			}
 			echoAudio = routes;
-			player = new Player(routes.playback, (error) => {
+			player = deps.createPlayer(routes.playback, (error) => {
 				if (session === current) teardown(`player: ${error.message}`, ctx);
 			});
-			recorder = new Recorder({
+			recorder = deps.createRecorder({
 				onFrame: (frame) => {
 					if (session !== current) return;
 					current.appendAudio(frame);
@@ -266,12 +307,11 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	function speak(text: string) {
+	function speak() {
 		// O áudio do modelo chega por `response.output_audio.delta`; só marcamos o estado.
 		speaking = true;
 		view = { ...view, phase: "speaking", speaking: true };
 		refresh();
-		void text;
 	}
 
 	function handleEvent(event: VoiceEvent, ctx: ExtensionContext) {
@@ -288,12 +328,11 @@ export default function (pi: ExtensionAPI) {
 					clearTimeout(speakingTimer);
 					speakingTimer = undefined;
 				}
-				if (!speaking) speak("");
+				if (!speaking) speak();
 				break;
 
 			case "speech_started":
-				// Barge-in: como o Codex, cancela a resposta no servidor e corta o áudio local.
-				session?.cancelResponse();
+				// Barge-in: o servidor cancela a resposta (interrupt_response); a sessão trunca o áudio.
 				speaking = false;
 				if (speakingTimer) clearTimeout(speakingTimer);
 				speakingTimer = undefined;
@@ -305,20 +344,25 @@ export default function (pi: ExtensionAPI) {
 				break;
 
 			case "speech_stopped":
-				view = { ...view, phase: pendingDelegations > 0 ? "working" : "listening" };
+				view = { ...view, phase: activeCall ? "working" : "listening" };
 				refresh();
 				break;
 
 			case "user_transcript":
-				recordTranscript(ctx, "user", event.text);
+				recordTranscript("user", event.text);
 				break;
 
 			case "assistant_transcript":
-				if (event.final) recordTranscript(ctx, "agent", event.text);
+				if (event.final) recordTranscript("agent", event.text);
 				break;
 
-			case "delegate":
-				void delegate(event.input, ctx);
+			case "background_agent":
+				handoff(event.callId, event.prompt, ctx);
+				break;
+
+			case "remain_silent":
+				// Sem efeito visível e sem resposta (`NoopRequested` do Codex).
+				session?.functionCallOutput(event.callId, "");
 				break;
 
 			case "response_done":
@@ -327,11 +371,7 @@ export default function (pi: ExtensionAPI) {
 				break;
 
 			case "error": {
-				const atual = session?.dialectInUse ?? "ga";
-				const alternativo = atual === "beta" ? "ga" : "beta";
-				const hint = event.dialectHint
-					? ` — payload rejeitado no dialeto "${atual}"; tente PI_VOICE_DIALECT=${alternativo}`
-					: "";
+				const hint = event.dialectHint ? " — payload rejeitado pela API; verifique o formato da sessão" : "";
 				ctx.ui.notify(`voz: ${event.message}${hint}`, "error");
 				break;
 			}
@@ -339,24 +379,31 @@ export default function (pi: ExtensionAPI) {
 		setStatus(ctx);
 	}
 
-	async function delegate(input: string, ctx: ExtensionContext) {
-		pendingDelegations += 1;
-		setPhase("working");
+	/**
+	 * `background_agent` (handle_handoff_output do Codex, V2):
+	 * - ocioso: inicia o turno; o resultado volta ao fim do run;
+	 * - agente em execução: steer da tarefa ativa, com ack imediato.
+	 */
+	function handoff(callId: string, prompt: string, ctx: ExtensionContext) {
+		const turn = wrapDelegation(prompt);
+		if (activeCall) {
+			// Steer: a chamada original completa no fim do run; esta recebe só o ack.
+			pi.sendUserMessage(turn, { deliverAs: "steer" });
+			session?.functionCallOutput(callId, STEER_ACK);
+			session?.createResponse();
+			return;
+		}
+		activeCall = callId;
 		view = { ...view, phase: "working" };
 		refresh();
 		setStatus(ctx);
-		recordTranscript(ctx, "user", input);
-
-		const turn = wrapDelegation(input);
 		try {
-			pi.sendUserMessage(turn);
-		} catch {
-			try {
-				pi.sendUserMessage(turn, { deliverAs: "steer" });
-			} catch (error) {
-				pendingDelegations = Math.max(0, pendingDelegations - 1);
-				ctx.ui.notify(`não consegui iniciar o turno: ${(error as Error).message}`, "error");
-			}
+			if (ctx.isIdle()) pi.sendUserMessage(turn);
+			else pi.sendUserMessage(turn, { deliverAs: "steer" });
+		} catch (error) {
+			activeCall = undefined;
+			session?.functionCallOutput(callId, `não consegui iniciar a tarefa: ${(error as Error).message}`);
+			session?.createResponse();
 		}
 	}
 
@@ -400,7 +447,7 @@ export default function (pi: ExtensionAPI) {
 							`voz: ${settings.voice}`,
 							`modelo: ${settings.model}`,
 							`credencial: ${key ? "ok" : "ausente"}`,
-							`transporte: ${session?.transport?.impl ?? "-"} · auth: ${session?.transport?.authMode ?? "-"} · dialeto: ${session?.dialectInUse ?? "-"}`,
+							`transporte: ${session?.transport?.impl ?? "-"} · auth: ${session?.transport?.authMode ?? "-"} · protocolo: realtime V2`,
 							`saída: ${player ? "aberta" : "fechada"} · entrada: ${recorder ? "aberta" : "fechada"}`,
 						].join("\n"),
 						"info",
@@ -526,21 +573,21 @@ export default function (pi: ExtensionAPI) {
 		return new Text(`${theme.fg("dim", prefix)} ${data.text}`, 0, 0);
 	});
 
+	pi.on("agent_start", () => {
+		agentRunning = true;
+	});
+
 	pi.on("agent_end", async (event, ctx) => {
-		if (!session || pendingDelegations === 0) return;
+		agentRunning = false;
+		if (!session || !activeCall) return;
+		const callId = activeCall;
+		activeCall = undefined;
+		// Resultado como item [BACKEND]; depois a conclusão da chamada, como no Codex V2.
 		const answer = finalAnswerText(event.messages);
-		pendingDelegations = Math.max(0, pendingDelegations - 1);
-		if (!answer) {
-			view = { ...view, phase: muted ? "muted" : "listening" };
-			refresh();
-			setStatus(ctx);
-			return;
-		}
-		const header = session.backendResult(answer, "final");
-		session.createResponse(
-			`${header.trim()} Resuma o resultado acima em 1 a 3 frases faladas, em português.`,
-		);
-		view = { ...view, phase: "speaking", speaking: true };
+		if (answer) session.backendItem(answer);
+		session.functionCallOutput(callId, HANDOFF_COMPLETE_ACK);
+		session.createResponse();
+		view = { ...view, phase: muted ? "muted" : "listening" };
 		refresh();
 		setStatus(ctx);
 	});
@@ -548,17 +595,17 @@ export default function (pi: ExtensionAPI) {
 	// Pedido de decisão (permission prompt, erro, confirmação) é anunciado por voz.
 	pi.on("ui_prompt_start", async (event, ctx) => {
 		if (!session) return;
-		const text = `o agente precisa de uma decisão: ${event.title ?? event.kind}`;
-		const header = session.backendResult(text, "decision");
-		session.createResponse(
-			`${header.trim()} Avise o usuário em uma frase curta, em português, que o agente está esperando uma decisão no terminal.`,
-		);
+		session.backendItem(`o agente precisa de uma decisão no terminal: ${event.title ?? event.kind}`);
+		session.createResponse();
 		refresh();
 		setStatus(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		if (session) teardown(undefined, ctx);
+		if (session) {
+			session.developerText(END_INSTRUCTIONS);
+			teardown(undefined, ctx);
+		}
 		await echoCleanup.flush().catch(() => ctx.ui.notify("falha ao liberar módulo AEC no shutdown", "warning"));
 	});
 }

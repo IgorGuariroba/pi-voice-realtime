@@ -5,7 +5,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-	backendHeader,
+	HANDOFF_COMPLETE_ACK,
+	STEER_ACK,
 	delegationTranscript,
 	finalAnswerText,
 	unwrapDelegation,
@@ -73,7 +74,13 @@ test("resposta final vazia vira undefined", () => {
 	assert.equal(finalAnswerText([]), undefined);
 });
 
-test("cabeçalho BACKEND igual ao do Codex", () => {
-	assert.equal(backendHeader("final"), "[BACKEND] Agent Final Message:\n\n");
-	assert.equal(backendHeader("decision"), "[BACKEND] Agent needs a decision:\n\n");
+test("textos de retorno da V2 iguais aos do Codex", () => {
+	assert.equal(HANDOFF_COMPLETE_ACK, "Background agent finished. Use the preceding [BACKEND] messages as the result.");
+	assert.equal(STEER_ACK, "This was sent to steer the previous background agent task.");
+});
+
+test("origem transcript_tail_flush aparece no envelope", () => {
+	const text = wrapDelegation("oi", undefined, "transcript_tail_flush");
+	assert.ok(text.includes("<source>transcript_tail_flush</source>"));
+	assert.equal(unwrapDelegation(text), "oi");
 });

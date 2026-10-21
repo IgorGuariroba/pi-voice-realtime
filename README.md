@@ -7,8 +7,8 @@ Conversa por voz full-duplex com o agente, no mesmo desenho do `/voice` do
 /voice
   → abre sessão realtime (mic aberto, VAD do servidor)
   → você fala; o modelo de voz responde falando
-  → pedido de código → delegate_to_pi → turno normal do agente pi
-  → ao terminar, a resposta final volta como [BACKEND] Agent Final Message
+  → pedido de trabalho → background_agent → turno normal do agente pi
+  → ao terminar, o resultado volta como [BACKEND] + function_call_output (ADR 0002)
   → o modelo de voz resume em 1–3 frases faladas
 ```
 
@@ -25,8 +25,9 @@ Conversa por voz full-duplex com o agente, no mesmo desenho do `/voice` do
 
 UI: widget acima do editor (`voice ● listening` / `mic ▂▃▅` / `f9 mute` /
 `/voice stop`) + linha no rodapé nativo, que segue mostrando tokens/git/modelo.
-Transcrição de voz aparece como entrada própria no histórico e **não** entra no
-contexto do modelo.
+Fala consolidada aparece no histórico e entra no contexto do agente como mensagem
+`[USER]` sem disparar turno (`sendMessage` sem `triggerTurn`), como o Codex grava
+`TranscriptSegment`.
 
 ## Credencial
 
@@ -46,7 +47,7 @@ ambiente servem para uso temporário ou CI.
 `~/.pi/agent/voice.json` (criado ao escolher a voz em `/voice settings`):
 
 ```json
-{ "voice": "marin", "model": "gpt-realtime", "muteOnStart": false, "ackFiller": "Deixa comigo, já volto com a resposta." }
+{ "voice": "marin", "model": "gpt-realtime-1.5", "muteOnStart": false }
 ```
 
 O caminho AEC atual usa os dispositivos padrão PulseAudio/PipeWire. Remova
@@ -79,7 +80,7 @@ no alto-falante ainda estão pendentes.
 | Autenticação do transporte | `ws` + `Authorization` | GA não envia `OpenAI-Beta`; ver abaixo |
 | WebRTC (SDP/ICE) | WebSocket PCM16 | mesmo modelo e mesmo VAD; evita `wrtc` nativo |
 | helper Rust + Sonora AEC + GStreamer + Opus | PulseAudio/PipeWire WebRTC AEC + `parec`/`pacat` | backend Linux, sem equivalência acústica comprovada |
-| handoff nativo + `delegation_ack_filler` | tool `delegate_to_pi` | a API pública não tem o handoff interno |
+| handoff V2 (`background_agent`, `remain_silent`) | mesmas tools, mesmos textos de retorno | paridade (ADR 0002) |
 | módulo `codex-realtime-webrtc` | `socket.ts` + `realtime.ts` + `audio.ts` | — |
 
 ### Transporte
@@ -94,9 +95,8 @@ key por um client secret efêmero em subprotocolo. O modo em uso aparece em
 
 ### Dialeto do payload
 
-`PI_VOICE_DIALECT=ga` (padrão) ou `beta`. Não há fallback automático: um erro de
-`session.update` é reportado com a dica de trocar o dialeto, porque reenviar em
-outro formato esconderia um payload errado.
+Só o formato GA (`session.update` da V2 do Codex). O dialeto beta foi removido: a V2
+não o usa. Erros de `session.update` são reportados, sem reenvio em outro formato.
 
 ### OpenRouter não serve para o modo realtime
 
@@ -106,11 +106,11 @@ duplex (`/v1/realtime`). Sem isso não há VAD contínuo, barge-in nem resposta
 falada em streaming. Usar OpenRouter implicaria um modo diferente (grava →
 transcreve → agente → TTS), que foi explicitamente descartado no escopo da v1.
 
-O que é fiel: play/pause do mic (`f9`), mute descartando buffer de captura,
-barge-in (cancela resposta + corta áudio local), transcrição exibida e fora do
-contexto, delegação como turno normal com envelope `<realtime_delegation>`,
-retorno `[BACKEND]`, resposta final falada resumida (reasoning nunca falado),
-aviso falado quando o agente para esperando decisão.
+O que é fiel ao Codex V2: resposta falada pelo próprio modelo, delegação como
+`background_agent` com envelope `<realtime_delegation>`, progresso e resultado como
+`[BACKEND]`, `function_call_output` ao concluir e no steer, fila de um
+`response.create` por vez, barge-in com `conversation.item.truncate`, fala no
+histórico do agente, e `remain_silent`.
 
 ## Testes
 
@@ -122,10 +122,10 @@ A suíte cobre também lifecycle da sessão realtime, handshake GA e propriedade
 rotas AEC (comandos de criação, uso do par e descarregamento idempotente).
 Esses testes não medem o desempenho acústico do cancelador.
 
-Os testes originais cobrem: parser de eventos realtime (nomes GA e beta) com fixtures,
-payload `session.update` nos dois dialetos, escolha explícita de dialeto, framing
-PCM de 20 ms com blocos irregulares, nível RMS do medidor, seleção de backend por
-SO e o contrato de delegação (round-trip com XML, extração da resposta final).
+Cobertura offline: parser de eventos GA com fixture, payload `session.update` V2
+(VAD, ferramentas, instruções), envelope de delegação, fila de `response.create`,
+truncate no barge-in, ciclo do handoff com socket falso (`tests/integration.test.ts`),
+contexto de início e framing PCM.
 
 ## Estado da validação
 
@@ -134,7 +134,11 @@ Comprovado: testes offline acima, carga no pi (`pi --help` sem erro),
 `arecord` (frames de 960 bytes, RMS coerente, stop limpo) e reprodução real com
 `aplay`, resolução de transporte (`loadWs()` → `ws`).
 
-**Não comprovado** (exige `OPENAI_API_KEY`): handshake e autenticação reais,
+**Bloqueio atual:** a chave em `~/.pi/agent/auth.json` recebe `You have no credits
+remaining` do servidor. O handshake autentica; o E2E de `session.update` e do handoff
+depende de crédito.
+
+**Não comprovado** (exige crédito na API): aceitação do payload `session.update`,
 payload aceito pelo servidor, eventos de áudio/transcrição, barge-in contra o
 servidor, reconexão, sincronismo do áudio e o ciclo completo
 fala → delegação → resposta falada. Esses pontos só podem ser considerados
@@ -143,6 +147,8 @@ prontos depois de um E2E real.
 ## Limites conhecidos
 
 - Device picker e captions persistentes ficaram para a v2 (decisão de escopo).
+- Sem fase de reconexão: queda do WebSocket encerra a sessão (Codex: `reconnect.rs`).
+- Sem transcript-tail-flush com turno: a fala já vai ao histórico na hora, então não sobra buffer ao encerrar.
 - Sem chave OpenAI, `/voice` avisa e não abre sessão — não há fallback local.
 - Reconexão automática não implementada: queda do WebSocket encerra a sessão.
 - A sessão mantém o microfone aberto até `/voice stop` (igual ao Codex), o que

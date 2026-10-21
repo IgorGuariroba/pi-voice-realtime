@@ -40,17 +40,14 @@ export interface VoiceSettings {
 	outputDevice?: string;
 	/** Começar mudo (f9 desmuta). */
 	muteOnStart: boolean;
-	/** Frase falada enquanto o pi trabalha (equivalente ao `delegation_ack_filler`). */
-	ackFiller: string;
 }
 
 export const DEFAULT_SETTINGS: VoiceSettings = {
 	voice: "marin",
-	model: "gpt-realtime",
+	model: "gpt-realtime-1.5",
 	inputDevice: undefined,
 	outputDevice: undefined,
 	muteOnStart: false,
-	ackFiller: "Deixa comigo, já volto com a resposta.",
 };
 
 export const SAMPLE_RATE = 24_000;
