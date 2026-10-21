@@ -1,0 +1,167 @@
+[
+	{
+		"name": "session.created",
+		"raw": {
+			"type": "session.created",
+			"session": {
+				"id": "sess_1",
+				"model": "gpt-realtime"
+			}
+		},
+		"expect": {
+			"kind": "ready"
+		}
+	},
+	{
+		"name": "audio delta GA",
+		"raw": {
+			"type": "response.output_audio.delta",
+			"delta": "AAAAAA=="
+		},
+		"expect": {
+			"kind": "audio",
+			"pcmBase64": "AAAAAA=="
+		}
+	},
+	{
+		"name": "audio delta beta",
+		"raw": {
+			"type": "response.audio.delta",
+			"delta": "//79"
+		},
+		"expect": {
+			"kind": "audio",
+			"pcmBase64": "//79"
+		}
+	},
+	{
+		"name": "user transcript",
+		"raw": {
+			"type": "conversation.item.input_audio_transcription.completed",
+			"item_id": "item_1",
+			"transcript": "  roda os testes do pacote  "
+		},
+		"expect": {
+			"kind": "user_transcript",
+			"text": "roda os testes do pacote"
+		}
+	},
+	{
+		"name": "assistant transcript delta",
+		"raw": {
+			"type": "response.output_audio_transcript.delta",
+			"delta": "Já estou"
+		},
+		"expect": {
+			"kind": "assistant_transcript",
+			"text": "Já estou",
+			"final": false
+		}
+	},
+	{
+		"name": "assistant transcript done",
+		"raw": {
+			"type": "response.audio_transcript.done",
+			"transcript": "Já estou olhando."
+		},
+		"expect": {
+			"kind": "assistant_transcript",
+			"text": "Já estou olhando.",
+			"final": true
+		}
+	},
+	{
+		"name": "speech started (barge-in)",
+		"raw": {
+			"type": "input_audio_buffer.speech_started",
+			"audio_start_ms": 1200
+		},
+		"expect": {
+			"kind": "speech_started"
+		}
+	},
+	{
+		"name": "speech stopped",
+		"raw": {
+			"type": "input_audio_buffer.speech_stopped"
+		},
+		"expect": {
+			"kind": "speech_stopped"
+		}
+	},
+	{
+		"name": "response done",
+		"raw": {
+			"type": "response.done",
+			"response": {
+				"status": "completed"
+			}
+		},
+		"expect": {
+			"kind": "response_done"
+		}
+	},
+	{
+		"name": "delegation function call",
+		"raw": {
+			"type": "response.function_call_arguments.done",
+			"name": "delegate_to_pi",
+			"call_id": "call_abc",
+			"arguments": "{\"input\":\"rode os testes do pacote voice\"}"
+		},
+		"expect": {
+			"kind": "delegate",
+			"callId": "call_abc",
+			"input": "rode os testes do pacote voice"
+		}
+	},
+	{
+		"name": "other function is ignored",
+		"raw": {
+			"type": "response.function_call_arguments.done",
+			"name": "some_other_tool",
+			"call_id": "call_xyz",
+			"arguments": "{}"
+		},
+		"expect": {
+			"kind": "other",
+			"type": "response.function_call_arguments.done"
+		}
+	},
+	{
+		"name": "delegation without input is an error",
+		"raw": {
+			"type": "response.function_call_arguments.done",
+			"name": "delegate_to_pi",
+			"call_id": "call_empty",
+			"arguments": "{}"
+		},
+		"expect": {
+			"kind": "error"
+		}
+	},
+	{
+		"name": "api error",
+		"raw": {
+			"type": "error",
+			"error": {
+				"message": "invalid model"
+			}
+		},
+		"expect": {
+			"kind": "error",
+			"message": "invalid model"
+		}
+	},
+	{
+		"name": "unknown event",
+		"raw": {
+			"type": "rate_limits.updated",
+			"rate_limits": []
+		},
+		"expect": {
+			"kind": "other",
+			"type": "rate_limits.updated"
+		}
+	}
+]

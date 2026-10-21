@@ -1,0 +1,9 @@
+node_modules/
+target/
+.env
+.env.*
+*.log
+*.wav
+*.pcm
+auth.json
+voice.json

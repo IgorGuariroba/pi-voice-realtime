@@ -1,0 +1,16 @@
+{
+	"description": "Blocos de tamanho arbitrário vindos de arecord/ffmpeg e os frames de 20 ms esperados (PCM16LE mono 24 kHz = 960 bytes por frame).",
+	"frameBytes": 960,
+	"cases": [
+		{ "name": "bloco do tamanho exato de um frame", "chunks": [960], "frames": [960], "remainder": 0 },
+		{ "name": "bloco de 2.5 frames", "chunks": [2400], "frames": [960, 960], "remainder": 480 },
+		{ "name": "dois blocos que só completam o frame juntos", "chunks": [480, 480], "frames": [960], "remainder": 0 },
+		{ "name": "bloco irregular típico do ALSA", "chunks": [1024, 1024, 1024], "frames": [960, 960, 960], "remainder": 192 },
+		{ "name": "blocos menores que um frame", "chunks": [100, 200, 300], "frames": [], "remainder": 600 }
+	],
+	"levels": [
+		{ "name": "silêncio", "samples": 480, "amplitude": 0, "max": 0.001 },
+		{ "name": "amplitude média", "samples": 480, "amplitude": 0.25, "min": 0.2, "max": 0.3 },
+		{ "name": "amplitude alta", "samples": 480, "amplitude": 0.9, "min": 0.85, "max": 0.95 }
+	]
+}
