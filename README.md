@@ -12,6 +12,12 @@ Conversa por voz full-duplex com o agente, no mesmo desenho do `/voice` do
   → o modelo de voz resume em 1–3 frases faladas
 ```
 
+## Demonstração
+
+[![Conversa por voz no Pi, com transcrição e medidores de áudio](docs/media/preview.png)](https://raw.githubusercontent.com/IgorGuariroba/pi-voice-realtime/main/docs/media/demo.mp4)
+
+[Assistir à demonstração (MP4, 20 segundos, sem áudio)](https://raw.githubusercontent.com/IgorGuariroba/pi-voice-realtime/main/docs/media/demo.mp4).
+
 ## Instalação
 
 Requer Linux com PulseAudio/PipeWire, `pactl`, `parec`, `pacat` e suporte ao
