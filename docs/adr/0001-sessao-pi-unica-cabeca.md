@@ -1,6 +1,6 @@
 # ADR 0001 — A sessão do pi é a única cabeça da conversa de voz
 
-**Status:** proposta (aguarda implementação)
+**Status:** superada pela ADR 0002 (paridade com o `/voice` do Codex). Mantida como histórico.
 
 ## Contexto
 
